@@ -118,10 +118,10 @@ def subsample_selector(ld, key):
 def download_row(fig, base_name, key_prefix):
     c1, c2 = st.columns(2)
     with c1:
-        st.download_button('📥 Скачать PNG', viz.fig_to_bytes(fig, 'png'),
+        st.download_button('📥 Сохранить PNG', viz.fig_to_bytes(fig, 'png'),
                             file_name=f'{base_name}.png', key=f'{key_prefix}_png')
     with c2:
-        st.download_button('📥 Скачать PDF', viz.fig_to_bytes(fig, 'pdf'),
+        st.download_button('📥 Сохранить PDF', viz.fig_to_bytes(fig, 'pdf'),
                             file_name=f'{base_name}.pdf', key=f'{key_prefix}_pdf')
 
 
@@ -342,11 +342,11 @@ with tab_data:
             st.dataframe(st.session_state.long_combined.head(20), use_container_width=True)
             c1, c2 = st.columns(2)
             with c1:
-                st.download_button('Скачать (.xlsx)',
+                st.download_button('Сохранить (.xlsx)',
                                     data_io.df_to_excel_bytes(st.session_state.long_combined),
                                     file_name='combined_long.xlsx')
             with c2:
-                st.download_button('Скачать (.csv)',
+                st.download_button('Сохранить (.csv)',
                                     data_io.df_to_csv_bytes(st.session_state.long_combined),
                                     file_name='combined_long.csv')
     else:
@@ -533,7 +533,7 @@ with tab_desc:
                 st.markdown(f'**Вывод о нормальности:** '
                             f'{descriptive.normality_conclusion(desc_target.iloc[0])}')
             safe_name = context_desc.replace(' ', '_').replace('·', '-')
-            st.download_button('Скачать таблицу (.xlsx)',
+            st.download_button('Сохранить таблицу (.xlsx)',
                                 data_io.df_to_excel_bytes(desc_target, 'Описательная стат.'),
                                 file_name=f'table_01_descriptive_{safe_name}.xlsx')
 
@@ -668,7 +668,7 @@ with tab_ind:
                 ind_table = st.session_state.indicators_table
                 st.subheader('Таблица индексов по станциям')
                 st.dataframe(ind_table, use_container_width=True)
-                st.download_button('Скачать таблицу (.xlsx)',
+                st.download_button('Сохранить таблицу (.xlsx)',
                                     data_io.df_to_excel_bytes(ind_table, 'Индексы'),
                                     file_name='table_indicators.xlsx')
 
@@ -681,7 +681,7 @@ with tab_ind:
                 feat_cols = indicators.indicator_feature_columns(ind_table)
                 desc_all = descriptive.descriptive_all_features(ind_table, feat_cols)
                 st.dataframe(desc_all, use_container_width=True)
-                st.download_button('Скачать (.xlsx)',
+                st.download_button('Сохранить (.xlsx)',
                                     data_io.df_to_excel_bytes(desc_all, 'Стат. по индексам'),
                                     file_name='table_02_descriptive_indicators.xlsx')
 
@@ -743,7 +743,7 @@ with tab_corr:
                 st.markdown(f'**Рекомендуется оставить:** {", ".join(keep_list)}')
                 st.markdown(f'**Рекомендуется исключить (избыточны):** '
                             f'{", ".join(drop_list) if drop_list else "—"}')
-                st.download_button('Скачать список пар (.xlsx)',
+                st.download_button('Сохранить список пар (.xlsx)',
                                     data_io.df_to_excel_bytes(pairs_df, 'Мультиколлинеарность'),
                                     file_name='table_multicollinearity_indicators.xlsx')
 
@@ -809,7 +809,7 @@ with tab_corr:
                     st.markdown(f'**Рекомендуется оставить:** {", ".join(keep_list)}')
                     st.markdown(f'**Рекомендуется исключить (избыточны):** '
                                 f'{", ".join(drop_list) if drop_list else "—"}')
-                    st.download_button('Скачать список пар (.xlsx)',
+                    st.download_button('Сохранить список пар (.xlsx)',
                                         data_io.df_to_excel_bytes(pairs_df, 'Мультиколлинеарность'),
                                         file_name=f'table_multicollinearity_{tip}.xlsx')
 
@@ -977,7 +977,7 @@ with tab_cluster:
             result_cols = ['Станция'] + [c for c in ['Название', 'Регион', 'Lat', 'Lon']
                                           if c in d_clean.columns] + ['Кластер'] + chosen_features
             st.dataframe(d_clean[result_cols], use_container_width=True)
-            st.download_button('📥 Скачать результат (станция → кластер, .xlsx)',
+            st.download_button('📥 Сохранить результат (станция → кластер, .xlsx)',
                                 data_io.df_to_excel_bytes(d_clean[result_cols], 'Районирование'),
                                 file_name='table_clustering_result.xlsx')
 
@@ -1020,7 +1020,7 @@ with tab_cluster:
             if summary_cols:
                 summ = clustering.cluster_summary_table(d_clean, summary_cols, 'Кластер')
                 st.dataframe(summ, use_container_width=True)
-                st.download_button('Скачать сводку по кластерам (.xlsx)',
+                st.download_button('Сохранить сводку по кластерам (.xlsx)',
                                     data_io.df_to_excel_bytes(summ, 'Сводка кластеров'),
                                     file_name='table_cluster_summary.xlsx')
 
@@ -1084,7 +1084,7 @@ with tab_cluster:
                                                              '4 — сама область/край; '
                                                              '8 — сельсоветы/города')
                     cache_key = f'{region_name}__{admin_level}'
-                    if st.button('🌐 Скачать границы районов'):
+                    if st.button('🌐 Сохранить границы районов'):
                         try:
                             with st.status('⏳ Идёт расчёт: запрос к Overpass API '
                                            '(может занять до минуты)...', expanded=True) as status:
@@ -1123,7 +1123,7 @@ with tab_cluster:
                                     'внутри границ; затем — районы без станций (кластер '
                                     'присвоен по ближайшей станции).')
                         st.dataframe(assign_table, use_container_width=True)
-                        st.download_button('Скачать таблицу район→кластер (.xlsx)',
+                        st.download_button('Сохранить таблицу район→кластер (.xlsx)',
                                             data_io.df_to_excel_bytes(assign_table, 'Районы'),
                                             file_name='table_district_clusters.xlsx')
 
@@ -1210,6 +1210,6 @@ with tab_cluster:
                                     'внутри границ; затем — районы без станций (кластер '
                                     'присвоен по ближайшей станции).')
                         st.dataframe(assign_table_u, use_container_width=True)
-                        st.download_button('Скачать таблицу район→кластер (.xlsx)',
+                        st.download_button('Сохранить таблицу район→кластер (.xlsx)',
                                             data_io.df_to_excel_bytes(assign_table_u, 'Районы'),
                                             file_name='table_district_clusters.xlsx')
