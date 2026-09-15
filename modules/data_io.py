@@ -305,6 +305,39 @@ def detect_format(df):
     return 'unknown'
 
 
+STATION_ID_KEYWORDS = ['станц', 'код', 'station']
+YEAR_ID_KEYWORDS = ['год', 'year']
+
+
+def standardize_id_columns(df, id_vars):
+    """
+    Переименовывает выбранные id-столбцы в канонические 'Станция' и 'Год'
+    по ключевым словам в названии, независимо от регистра ("год" -> "Год",
+    "Код станции" -> "Станция" и т.п.). Весь остальной код (фильтрация,
+    объединение показателей, присоединение справочника станций) полагается
+    на эти канонические имена, поэтому несовпадение регистра/названия в
+    исходном файле иначе привело бы к KeyError на более поздних шагах.
+    Возвращает (df с переименованными столбцами, новый список id_vars).
+    """
+    rename_map = {}
+    used_targets = set()
+    for col in id_vars:
+        if col in ('Станция', 'Год'):
+            used_targets.add(col)
+            continue
+        cl = str(col).lower()
+        if 'Станция' not in used_targets and any(k in cl for k in STATION_ID_KEYWORDS):
+            rename_map[col] = 'Станция'
+            used_targets.add('Станция')
+        elif 'Год' not in used_targets and any(k in cl for k in YEAR_ID_KEYWORDS):
+            rename_map[col] = 'Год'
+            used_targets.add('Год')
+
+    new_df = df.rename(columns=rename_map) if rename_map else df
+    new_id_vars = [rename_map.get(c, c) for c in id_vars]
+    return new_df, new_id_vars
+
+
 def wide_months_to_long(df, id_vars, value_name='Значение', month_col_name='Месяц',
                          decade_agg='mean'):
     """
@@ -314,12 +347,16 @@ def wide_months_to_long(df, id_vars, value_name='Значение', month_col_na
     цифры, номера 1-12. Декадные столбцы ("1 декада апреля" и т.п.)
     автоматически сворачиваются в одно месячное значение — суммой
     (decade_agg='sum', обычно для осадков) или средним (decade_agg='mean',
-    обычно для температуры).
+    обычно для температуры). id-столбцы (станция/год) автоматически
+    приводятся к каноническим именам 'Станция'/'Год' независимо от их
+    исходного написания.
     id_vars — список столбцов-идентификаторов (например ['Станция', 'Год']).
     """
     missing = [c for c in id_vars if c not in df.columns]
     if missing:
         raise ValueError(f'Не найдены id-столбцы: {missing}')
+
+    df, id_vars = standardize_id_columns(df, id_vars)
 
     month_map, matched_cols = scan_month_columns(df)
 
@@ -465,9 +502,13 @@ def build_extra_features_table(df, id_vars, extra_cols):
     Формирует таблицу "как есть" из столбцов, не распознанных как месяцы/
     декады (например готовые предрассчитанные периодные суммы вида
     "X - III", "21.V - 20.VI") — без попытки интерпретировать их смысл.
-    Значения приводятся к числу, где возможно.
+    Значения приводятся к числу, где возможно. id-столбцы приводятся к
+    каноническим именам 'Станция'/'Год' (см. standardize_id_columns), чтобы
+    дальнейшее объединение с таблицей индексов работало независимо от
+    исходного написания.
     """
     out = df[id_vars + extra_cols].copy()
+    out, _ = standardize_id_columns(out, id_vars)
     for c in extra_cols:
         out[c] = pd.to_numeric(out[c], errors='coerce')
     return out
