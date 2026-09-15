@@ -34,9 +34,11 @@ if 'subsamples' not in st.session_state:
     st.session_state.subsamples = {}             # {'Весь период': (y_min, y_max), 'Ранний период': (...), ...}
 if 'feature_sets' not in st.session_state:
     st.session_state.feature_sets = {}           # {'название набора': [список признаков]}
+if 'extra_features' not in st.session_state:
+    st.session_state.extra_features = {}         # {'источник': DataFrame(Станция, Год, доп.показатели)}
 
-st.title('🌍 Программа климатического районирования территорий на основе кластеризации метеостанций по их климатическим характеристикам')
-st.caption('Разработчик: Дмитрий Сергеевич Федоров, научный сотрудник, отдел гидрометеорологии и экологии, Сибирский Региональный научно-исследовательский Гидрометеорологический Институт (ФГБУ СибНИГМИ)')
+st.title('🌍 Климатическое районирование территорий')
+st.caption('Кластерный анализ и статистика климатических характеристик')
 
 tab_data, tab_sub, tab_desc, tab_ind, tab_corr, tab_cluster = st.tabs([
     '1. Данные', '2. Подвыборки и периоды', '3. Описательная статистика',
@@ -118,10 +120,10 @@ def subsample_selector(ld, key):
 def download_row(fig, base_name, key_prefix):
     c1, c2 = st.columns(2)
     with c1:
-        st.download_button('📥 Сохранить PNG', viz.fig_to_bytes(fig, 'png'),
+        st.download_button('📥 Скачать PNG', viz.fig_to_bytes(fig, 'png'),
                             file_name=f'{base_name}.png', key=f'{key_prefix}_png')
     with c2:
-        st.download_button('📥 Сохранить PDF', viz.fig_to_bytes(fig, 'pdf'),
+        st.download_button('📥 Скачать PDF', viz.fig_to_bytes(fig, 'pdf'),
                             file_name=f'{base_name}.pdf', key=f'{key_prefix}_pdf')
 
 
@@ -231,27 +233,65 @@ with tab_data:
                 if role == 'Климатический показатель (температура, осадки и т.п.)':
                     fmt = data_io.detect_format(df_raw)
                     if fmt != 'wide_months':
-                        st.warning('Не похоже на широкий формат "Станция/Год + 12 месяцев". '
-                                   'Убедитесь, что столбцы месяцев называются как в списке '
-                                   '(Январь, Февраль, ...).')
+                        st.warning('Не похоже на широкий формат "Станция/Год + месяцы". '
+                                   'Столбцы-месяцы распознаются гибко (любой регистр, '
+                                   'сокращения, римские цифры, номера, декады), но их должно '
+                                   'быть не меньше 6.')
                     guessed_label = data_io.guess_indicator_label(name_for_guess, df_raw)
                     default_label = guessed_label or name_for_guess
                     tip_label = st.text_input('Название показателя (например "Температура", '
                                                '"Осадки")', value=default_label,
                                                key=f'label_{f.name}_{sheet}')
-                    id_candidates = [c for c in df_raw.columns
-                                      if c not in data_io.MONTHS_RU + data_io.MONTHS_RU_SHORT]
+
+                    _, matched_month_cols = data_io.scan_month_columns(df_raw)
+                    id_candidates = [c for c in df_raw.columns if c not in matched_month_cols]
+                    default_ids = data_io.guess_id_columns(id_candidates)
                     id_vars = st.multiselect('Столбцы-идентификаторы (Станция, Год)',
-                                              id_candidates, default=id_candidates,
+                                              id_candidates, default=default_ids,
                                               key=f'idvars_{f.name}_{sheet}')
+
+                    extra_candidates = [c for c in id_candidates if c not in id_vars]
+                    extra_cols = []
+                    if extra_candidates:
+                        with st.expander(f'📦 Дополнительные предрассчитанные показатели '
+                                         f'({len(extra_candidates)} столбцов — периодные суммы '
+                                         f'и т.п., не месяцы)', expanded=False):
+                            st.caption('Эти столбцы не похожи на отдельные месяцы (например '
+                                       'готовые суммы за произвольные периоды вида "X - III"). '
+                                       'Можно сохранить их как есть — они станут доступны как '
+                                       'дополнительные признаки для корреляции/кластеризации, '
+                                       'без попытки интерпретировать их как месячные значения.')
+                            extra_cols = st.multiselect('Сохранить эти столбцы как '
+                                                         'дополнительные показатели',
+                                                         extra_candidates,
+                                                         default=extra_candidates,
+                                                         key=f'extracols_{f.name}_{sheet}')
+
+                    decade_agg = 'mean'
+                    if data_io.has_decade_columns(df_raw):
+                        st.caption('🔍 Обнаружены декадные столбцы (например "1 декада '
+                                   'апреля") — они будут объединены в месячное значение.')
+                        default_agg_label = ('Сумма' if data_io.default_agg_for_type(default_label) == 'sum'
+                                              else 'Среднее')
+                        agg_choice = st.radio('Как объединять декады в месяц',
+                                               ['Среднее', 'Сумма'],
+                                               index=0 if default_agg_label == 'Среднее' else 1,
+                                               horizontal=True, key=f'decade_agg_{f.name}_{sheet}')
+                        decade_agg = 'sum' if agg_choice == 'Сумма' else 'mean'
+
                     if st.button(f'➕ Добавить как показатель «{tip_label}»',
                                  key=f'add_{f.name}_{sheet}'):
                         try:
                             long_typed = data_io.wide_months_to_long_typed(
-                                df_raw, id_vars, tip_label)
+                                df_raw, id_vars, tip_label, decade_agg=decade_agg)
                             st.session_state.typed_datasets[tip_label] = long_typed
-                            st.success(f'Показатель «{tip_label}» добавлен '
-                                       f'({len(long_typed)} строк).')
+                            msg = f'Показатель «{tip_label}» добавлен ({len(long_typed)} строк).'
+                            if extra_cols:
+                                extra_table = data_io.build_extra_features_table(
+                                    df_raw, id_vars, extra_cols)
+                                st.session_state.extra_features[tip_label] = extra_table
+                                msg += f' Плюс {len(extra_cols)} доп. показателей сохранено отдельно.'
+                            st.success(msg)
                         except Exception as e:
                             st.error(f'Ошибка преобразования: {e}')
 
@@ -342,11 +382,11 @@ with tab_data:
             st.dataframe(st.session_state.long_combined.head(20), use_container_width=True)
             c1, c2 = st.columns(2)
             with c1:
-                st.download_button('Сохранить (.xlsx)',
+                st.download_button('Скачать (.xlsx)',
                                     data_io.df_to_excel_bytes(st.session_state.long_combined),
                                     file_name='combined_long.xlsx')
             with c2:
-                st.download_button('Сохранить (.csv)',
+                st.download_button('Скачать (.csv)',
                                     data_io.df_to_csv_bytes(st.session_state.long_combined),
                                     file_name='combined_long.csv')
     else:
@@ -533,7 +573,7 @@ with tab_desc:
                 st.markdown(f'**Вывод о нормальности:** '
                             f'{descriptive.normality_conclusion(desc_target.iloc[0])}')
             safe_name = context_desc.replace(' ', '_').replace('·', '-')
-            st.download_button('Сохранить таблицу (.xlsx)',
+            st.download_button('Скачать таблицу (.xlsx)',
                                 data_io.df_to_excel_bytes(desc_target, 'Описательная стат.'),
                                 file_name=f'table_01_descriptive_{safe_name}.xlsx')
 
@@ -666,9 +706,35 @@ with tab_ind:
 
             if st.session_state.indicators_table is not None:
                 ind_table = st.session_state.indicators_table
+
+                if st.session_state.extra_features:
+                    with st.expander('📦 Добавить дополнительные предрассчитанные показатели',
+                                     expanded=False):
+                        st.caption('Показатели, сохранённые "как есть" при загрузке данных '
+                                   '(периодные суммы и т.п.) — присоединяются к таблице '
+                                   'индексов по станции, усредняя по годам.')
+                        sources = st.multiselect('Источники', list(st.session_state.extra_features.keys()),
+                                                  key='extra_merge_sources')
+                        if sources and st.button('➕ Присоединить к таблице индексов'):
+                            merged = ind_table.copy()
+                            for src in sources:
+                                extra_df = st.session_state.extra_features[src]
+                                agg_extra = data_io.aggregate_extra_features_by_station(
+                                    extra_df, station_col='Станция',
+                                    exclude_cols=[c for c in extra_df.columns
+                                                  if c not in extra_df.select_dtypes(
+                                                      include=[np.number]).columns
+                                                  and c != 'Станция'] + ['Год', 'год'])
+                                merged = merged.merge(agg_extra, on='Станция', how='left',
+                                                       suffixes=('', f'_{src}'))
+                            st.session_state.indicators_table = merged
+                            st.success(f'Присоединено. Итоговая таблица: {merged.shape[1]-1} '
+                                       f'показателей на {len(merged)} станций.')
+                            st.rerun()
+
                 st.subheader('Таблица индексов по станциям')
                 st.dataframe(ind_table, use_container_width=True)
-                st.download_button('Сохранить таблицу (.xlsx)',
+                st.download_button('Скачать таблицу (.xlsx)',
                                     data_io.df_to_excel_bytes(ind_table, 'Индексы'),
                                     file_name='table_indicators.xlsx')
 
@@ -681,7 +747,7 @@ with tab_ind:
                 feat_cols = indicators.indicator_feature_columns(ind_table)
                 desc_all = descriptive.descriptive_all_features(ind_table, feat_cols)
                 st.dataframe(desc_all, use_container_width=True)
-                st.download_button('Сохранить (.xlsx)',
+                st.download_button('Скачать (.xlsx)',
                                     data_io.df_to_excel_bytes(desc_all, 'Стат. по индексам'),
                                     file_name='table_02_descriptive_indicators.xlsx')
 
@@ -743,7 +809,7 @@ with tab_corr:
                 st.markdown(f'**Рекомендуется оставить:** {", ".join(keep_list)}')
                 st.markdown(f'**Рекомендуется исключить (избыточны):** '
                             f'{", ".join(drop_list) if drop_list else "—"}')
-                st.download_button('Сохранить список пар (.xlsx)',
+                st.download_button('Скачать список пар (.xlsx)',
                                     data_io.df_to_excel_bytes(pairs_df, 'Мультиколлинеарность'),
                                     file_name='table_multicollinearity_indicators.xlsx')
 
@@ -809,7 +875,7 @@ with tab_corr:
                     st.markdown(f'**Рекомендуется оставить:** {", ".join(keep_list)}')
                     st.markdown(f'**Рекомендуется исключить (избыточны):** '
                                 f'{", ".join(drop_list) if drop_list else "—"}')
-                    st.download_button('Сохранить список пар (.xlsx)',
+                    st.download_button('Скачать список пар (.xlsx)',
                                         data_io.df_to_excel_bytes(pairs_df, 'Мультиколлинеарность'),
                                         file_name=f'table_multicollinearity_{tip}.xlsx')
 
@@ -977,7 +1043,7 @@ with tab_cluster:
             result_cols = ['Станция'] + [c for c in ['Название', 'Регион', 'Lat', 'Lon']
                                           if c in d_clean.columns] + ['Кластер'] + chosen_features
             st.dataframe(d_clean[result_cols], use_container_width=True)
-            st.download_button('📥 Сохранить результат (станция → кластер, .xlsx)',
+            st.download_button('📥 Скачать результат (станция → кластер, .xlsx)',
                                 data_io.df_to_excel_bytes(d_clean[result_cols], 'Районирование'),
                                 file_name='table_clustering_result.xlsx')
 
@@ -1020,7 +1086,7 @@ with tab_cluster:
             if summary_cols:
                 summ = clustering.cluster_summary_table(d_clean, summary_cols, 'Кластер')
                 st.dataframe(summ, use_container_width=True)
-                st.download_button('Сохранить сводку по кластерам (.xlsx)',
+                st.download_button('Скачать сводку по кластерам (.xlsx)',
                                     data_io.df_to_excel_bytes(summ, 'Сводка кластеров'),
                                     file_name='table_cluster_summary.xlsx')
 
@@ -1084,7 +1150,7 @@ with tab_cluster:
                                                              '4 — сама область/край; '
                                                              '8 — сельсоветы/города')
                     cache_key = f'{region_name}__{admin_level}'
-                    if st.button('🌐 Сохранить границы районов'):
+                    if st.button('🌐 Скачать границы районов'):
                         try:
                             with st.status('⏳ Идёт расчёт: запрос к Overpass API '
                                            '(может занять до минуты)...', expanded=True) as status:
@@ -1123,7 +1189,7 @@ with tab_cluster:
                                     'внутри границ; затем — районы без станций (кластер '
                                     'присвоен по ближайшей станции).')
                         st.dataframe(assign_table, use_container_width=True)
-                        st.download_button('Сохранить таблицу район→кластер (.xlsx)',
+                        st.download_button('Скачать таблицу район→кластер (.xlsx)',
                                             data_io.df_to_excel_bytes(assign_table, 'Районы'),
                                             file_name='table_district_clusters.xlsx')
 
@@ -1210,6 +1276,6 @@ with tab_cluster:
                                     'внутри границ; затем — районы без станций (кластер '
                                     'присвоен по ближайшей станции).')
                         st.dataframe(assign_table_u, use_container_width=True)
-                        st.download_button('Сохранить таблицу район→кластер (.xlsx)',
+                        st.download_button('Скачать таблицу район→кластер (.xlsx)',
                                             data_io.df_to_excel_bytes(assign_table_u, 'Районы'),
                                             file_name='table_district_clusters.xlsx')
