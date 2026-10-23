@@ -33,7 +33,7 @@ def pettitt_test(series):
 
     K = np.max(np.abs(U))
     t_idx = int(np.argmax(np.abs(U)))
-    p = 2 * np.exp(-6 * K ** 2 / (n ** 3 + n ** 2))
+    p = min(1.0, 2 * np.exp(-6 * K ** 2 / (n ** 3 + n ** 2)))
     change_year = years[t_idx]
 
     return dict(K=K, p=p, change_year=int(change_year), U=U, years=years, n=n)
