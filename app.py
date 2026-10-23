@@ -1,1293 +1,1281 @@
 """
 =============================================================================
-ПРОГРАММА ПОДГОТОВКИ КЛИМАТИЧЕСКИХ ДАННЫХ И ОЦЕНКИ КЛИМАТИЧЕСКИХ РИСКОВ
-ДЛЯ РЕГИОНАЛЬНЫХ ПЛАНОВ АДАПТАЦИИ
-
-Автор: Федоров Дмитрий Сергеевич, научный сотрудник отдела гидрометеорологии
-и экологии ФГБУ «СибНИГМИ».
-
-Цепочка: загрузка суточных данных → проверка → контроль качества →
-восстановление пропусков → климатические показатели → тренды и сравнение
-периодов → районирование → карты → экспорт. Регионы обрабатываются
-раздельно. Модули оформления, кластеризации и загрузки границ общие с
-программой климатического районирования (climatezoning-sibnigmi.streamlit.app).
-
+ПРОГРАММА КЛИМАТИЧЕСКОГО РАЙОНИРОВАНИЯ ТЕРРИТОРИЙ
+MVP — инкремент 2: многотиповая модель данных (температура/осадки/
+справочник станций), контекстная описательная статистика, настраиваемые
+графики, автопроверка мультиколлинеарности.
 Запуск: streamlit run app.py
 =============================================================================
 """
 
-import os
-import io
-import sys
-import json
-import pickle
-import re
-import tempfile
-import warnings
-
-warnings.filterwarnings('ignore')
-import numpy as np
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import numpy as np
+import warnings
+warnings.filterwarnings('ignore')
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import params as P
-from config import cf
-from modules import (loader, xlsx_daily, readers, verify, qc, fill, derived, indices, trends, clustering, viz,
-                     charts, maps, basemap, interp, mapping, export)
+from modules import data_io, descriptive, correlation, viz, indicators, tests_stat, clustering, mapping
+from config import PALETTE
 
-APP_TITLE = 'Оценка климатических рисков для региональных планов адаптации'
-st.set_page_config(page_title=APP_TITLE, layout='wide')
+st.set_page_config(page_title='Климатическое районирование', layout='wide')
 
-S = st.session_state
-DEFAULTS = dict(districts_all=None, x_map=None, x_files=None, x_uploads=None, raw=None, stations=None, checks=None, comp=None, gaps=None, qc_log=None, clean=None,
-                flags=None, filled=None, fill_log=None, cv=None, D=None, ann=None, events=None,
-                zoning=None, districts=None, water=None, dem=None, figs={}, tables={})
-for k, v in DEFAULTS.items():
-    if k not in S:
-        S[k] = v if not isinstance(v, dict) else dict(v)
-# критерии и сезоны хранятся в сессии пользователя (у каждого пользователя свои)
-import copy
-if 'criteria' not in S:
-    S.criteria = copy.deepcopy(P.CRITERIA)
-if 'seasons' not in S:
-    S.seasons = copy.deepcopy(P.SEASONS)
-P.CRITERIA = S.criteria
-P.SEASONS = S.seasons
-MONTHS_RU = ['январь', 'февраль', 'март', 'апрель', 'май', 'июнь', 'июль', 'август', 'сентябрь', 'октябрь',
-             'ноябрь', 'декабрь']
-ROMAN = ['I', 'II', 'III', 'IV', 'V', 'VI', 'VII', 'VIII', 'IX', 'X', 'XI', 'XII']
+# ─── Состояние сессии ────────────────────────────────────────────────────
+if 'typed_datasets' not in st.session_state:
+    st.session_state.typed_datasets = {}       # {'Температура': long_df, 'Осадки': long_df, ...}
+if 'stations_ref' not in st.session_state:
+    st.session_state.stations_ref = None        # DataFrame справочника станций (сырой)
+if 'stations_ref_map' not in st.session_state:
+    st.session_state.stations_ref_map = None     # словарь сопоставления столбцов
+if 'long_combined' not in st.session_state:
+    st.session_state.long_combined = None        # итоговая объединённая таблица
+if 'indicators_table' not in st.session_state:
+    st.session_state.indicators_table = None     # рассчитанные климатические индексы
+if 'subsamples' not in st.session_state:
+    st.session_state.subsamples = {}             # {'Весь период': (y_min, y_max), 'Ранний период': (...), ...}
+if 'feature_sets' not in st.session_state:
+    st.session_state.feature_sets = {}           # {'название набора': [список признаков]}
+if 'extra_features' not in st.session_state:
+    st.session_state.extra_features = {}         # {'источник': DataFrame(Станция, Год, доп.показатели)}
 
+st.title('🌍 Программа климатического районирования территорий на основе кластеризации метеостанций по их характеристикам')
+st.caption('Автор: Федоров Дмитрий Сергеевич, научный сотрудник отдела гидрометеорологии и экологии ФГБУ «СибНИГМИ»')
 
-def season_txt(rg, key):
-    a, b = P.seasons_for(rg)[key]
-    return f'{ROMAN[a - 1]}–{ROMAN[b - 1]}'
+tab_data, tab_sub, tab_desc, tab_ind, tab_corr, tab_cluster = st.tabs([
+    '1. Данные', '2. Подвыборки и периоды', '3. Описательная статистика',
+    '4. Климатические индексы', '5. Корреляция и мультиколлинеарность',
+    '6. Районирование (кластеризация)'
+])
 
-VAR_LABEL = {k: readers.var_label(k) for k in readers.VAR_INFO}
-COMP_LABEL = {'tmin': 'Минимальная температура (Tмин)', 'tmax': 'Максимальная температура (Tмакс)',
-              'tmean': 'Средняя суточная температура (Tср)', 'rr_n': 'Осадки за ночь', 'rr_d': 'Осадки за день',
-              'rr_s': 'Осадки за сутки', 'fm_n': 'Максимальный ветер за ночь', 'fm_d': 'Максимальный ветер за день',
-              'fm_s': 'Максимальный ветер за сутки', 'ts00': 'Температура поверхности почвы, 00 ВСВ',
-              'ts12': 'Температура поверхности почвы, 12 ВСВ', 'fr': 'Класс пожарной опасности'}
-for h in derived.HOURS:
-    COMP_LABEL[f'tt{h}'] = f'Температура воздуха (T), {h} ВСВ'
-    COMP_LABEL[f'td{h}'] = f'Температура точки росы (Td), {h} ВСВ'
-    COMP_LABEL[f'rh{h}'] = f'Относительная влажность (RH), {h} ВСВ'
-GLOSSARY = [(k, v['name'], v['unit']) for k, v in readers.VAR_INFO.items()] + [
-    ('Tмин, Tмакс, Tср', 'Минимальная, максимальная и средняя суточная температура воздуха', '°C'),
-    ('Td', 'Температура точки росы', '°C'),
-    ('ВСВ', 'Всемирное скоординированное время; сроки наблюдений 00, 03, …, 21 ВСВ', ''),
-    ('ОЯ, НЯ', 'Опасное и неблагоприятное (комплекс неблагоприятных) гидрометеорологическое явление', ''),
-    ('АЖ, СЖ', 'Аномально жаркая погода и сильная жара (критерии ОЯ)', ''),
-    ('АХ', 'Аномально холодная погода (критерий ОЯ)', ''),
-    ('ГТК', 'Гидротермический коэффициент Селянинова', ''),
-    ('ГСОП', 'Градусо-сутки отопительного периода', '°C·сут'),
-]
+CHART_SIZE_PRESETS = {
+    'Компактный (8×5)': (8, 5),
+    'Матрица (10×8)': (10, 8),
+    'Широкий (12×8)': (12, 8),
+    'Крупный (14×12)': (14, 12),
+}
 
 
-def pretty_codes(df):
-    """Коды переменных и компонентов в таблицах заменяются полными названиями с обозначением."""
-    if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-        return df
-    df = df.copy()
-    if 'Переменная' in df and df['Переменная'].isin(list(VAR_LABEL)).any():
-        df['Переменная'] = df['Переменная'].map(lambda v: VAR_LABEL.get(v, v))
-    if 'Компонент' in df and df['Компонент'].isin(list(COMP_LABEL)).any():
-        df['Компонент'] = df['Компонент'].map(lambda v: COMP_LABEL.get(v, v))
-    return df
-
-
-# ─── Вспомогательные функции интерфейса ─────────────────────────────────
-ZONING_URL = 'https://climatezoning-sibnigmi.streamlit.app'
-AUTHOR = ('Автор: Федоров Дмитрий Сергеевич, научный сотрудник отдела гидрометеорологии и экологии '
-          'ФГБУ «СибНИГМИ»')
-
-with st.sidebar:
-    st.markdown('**Отображение**')
-    FIG_W = st.slider('Ширина графиков, % окна', 25, 100, 45, 5,
-                      help='Размер на экране. Файлы PNG и PDF сохраняются в исходном размере, 300 dpi.')
-    MAP_W = st.slider('Ширина карт, % окна', 30, 100, 60, 5)
-    st.markdown('**Обработка**')
-    P.NEIGHBOR_SAME_REGION = st.checkbox('Соседние станции — только из того же региона',
-                                         value=P.NEIGHBOR_SAME_REGION,
-                                         help='Используется при контроле качества и восстановлении пропусков. '
-                                              'Снимите флажок, чтобы учитывать и станции соседних регионов '
-                                              '(полезно для станций у границы).')
-    st.markdown('---')
-    st.markdown(f'Программа климатического районирования: [{ZONING_URL.replace("https://", "")}]({ZONING_URL})')
-
-
-def footnote(text):
-    """Сноска под таблицей или графиком."""
-    st.caption(f'ⓘ {text}')
-
-
-def show_df(df, decimals=2, height=None):
-    if df is None or len(df) == 0:
-        st.caption('Нет данных.')
-        return
-    kw = dict(height=height) if height else {}
-    df = pretty_codes(df)
-    st.dataframe(export.comma_frame(df, decimals), width='stretch', hide_index=True, **kw)
-
-
-def save_table(name, df, decimals=2):
-    """Запоминает таблицу для итогового архива и показывает кнопку скачивания."""
-    df = pretty_codes(df)
-    S.tables[name] = (df, decimals)
-    st.download_button(f'Скачать {name}.xlsx', export.xlsx_bytes({'Таблица': df}, decimals),
-                       file_name=f'{name}.xlsx', key=f'dl_{name}')
-
-
-def show_fig(fig, name, wide=False, kind_='chart'):
-    """График на экране (ширина — из боковой панели) + кнопки PNG/PDF."""
-    import matplotlib.pyplot as plt
-    S.figs[name] = fig
-    w = (MAP_W if kind_ == 'map' else min(100, FIG_W * (1.6 if wide else 1))) / 100
-    c = st.columns([w, 1 - w])[0] if w < 0.999 else st.container()
-    with c:
-        st.pyplot(fig, width='stretch')
-        a, b = st.columns(2)
-        a.download_button('PNG, 300 dpi', export.fig_bytes(fig, 'png'), file_name=f'{name}.png', key=f'png_{name}')
-        b.download_button('PDF', export.fig_bytes(fig, 'pdf'), file_name=f'{name}.pdf', key=f'pdf_{name}')
-    plt.close(fig)
-
-
-def station_names():
-    if S.stations is None:
-        return {}
-    return dict(zip(S.stations['st'], S.stations['name']))
-
-
-_NAMES = {}
-
-
-def refresh_names():
-    global _NAMES
-    _NAMES = station_names()
-
-
-def st_label(s):
-    return f'{_NAMES.get(s, s)} ({s})'
-
-
-def regions():
-    """Регионы, представленные в загруженных данных (в порядке справочника станций)."""
-    if S.stations is None:
-        return []
-    return [r for r in pd.unique(S.stations['region'].dropna().astype(str))]
-
-
-def region_tabs():
-    """Вкладки по регионам: каждый регион анализируется отдельно."""
-    rs = regions()
-    if len(rs) <= 1:
-        return [(r, st.container()) for r in rs]
-    return list(zip(rs, st.tabs(rs)))
-
-
-def region_data(data, rg):
-    return {v: d[d['region'] == rg] for v, d in data.items()}
-
-
-def region_stations(rg):
-    return S.stations[S.stations['region'] == rg]
-
-
-def numeric_stations(t):
-    t = t.copy()
-    for c in ('lat', 'lon', 'alt'):
-        if c in t:
-            t[c] = pd.to_numeric(t[c].astype(str).str.replace(',', '.'), errors='coerce')
-    t['st'] = pd.to_numeric(t['st'], errors='coerce').astype(int)
-    return t
-
-
-def apply_regions():
-    """Регион станции из справочника переносится во все переменные данных."""
-    if not S.raw or S.stations is None:
-        return
-    rmap = dict(zip(S.stations['st'], S.stations['region']))
-    for d in S.raw['data'].values():
-        d['region'] = d['st'].map(rmap).fillna(d['region'])
-
-
-def current_data(prefer='filled'):
-    if prefer == 'filled' and S.filled is not None:
-        return S.filled
-    if S.clean is not None:
-        return S.clean
-    return S.raw['data'] if S.raw else None
-
-
-def stations_xy():
-    t = S.stations
-    if t is None:
-        return None
-    t = numeric_stations(t)
-    return t.dropna(subset=['lat', 'lon'])
-
-
-refresh_names()
-st.title(APP_TITLE)
-st.markdown(f'<div style="color:#555;margin-top:-0.6rem">{AUTHOR}</div>', unsafe_allow_html=True)
-st.caption('Подготовка суточных данных метеостанций (проверка, контроль качества, восстановление пропусков), '
-           'расчёт показателей климатических рисков, районирование и карты')
-
-tabs = st.tabs(['1. Данные', '2. Проверка', '3. Контроль качества', '4. Пропуски', '5. Показатели',
-                '6. Тренды и периоды', '7. Районирование', '8. Карты', '9. Экспорт'])
-
-# ═══════════════════════════ 1. ДАННЫЕ ═══════════════════════════════════
-with tabs[0]:
-    st.header('Загрузка суточных данных')
-    st.markdown('Загрузите файлы или архивы в любом сочетании — программа сама определит их тип, прочитает, '
-                'сверит и объединит:')
-    st.markdown('- файлы станционного формата: ' + '; '.join(f'{VAR_LABEL[k]}' for k in readers.VAR_INFO
-                                                            if k != 'DY') + '; справочники станций `index_*`;\n'
-                '- суточные таблицы Excel/CSV по станциям с многострочной шапкой (значения вида «+12.3», «12,3», '
-                '«<0.5», «/», «20 км» приводятся к числам);\n'
-                '- архивы ZIP, RAR, 7z, в том числе вложенные.')
-    with st.expander('Обозначения переменных и сокращения', expanded=False):
-        st.dataframe(pd.DataFrame(GLOSSARY, columns=['Обозначение', 'Расшифровка', 'Единицы']),
-                     width='stretch', hide_index=True)
-    ups = st.file_uploader('Файлы и архивы с данными', accept_multiple_files=True,
-                           type=['zip', 'rar', '7z', 'xlsx', 'xls', 'csv', 'txt', 'dat'])
-    known = list(dict.fromkeys(regions() + list(P.CRITERIA)))
-    with st.expander('Параметры чтения', expanded=False):
-        c1, c2 = st.columns(2)
-        x_reg_sel = c1.selectbox('Регион станций из таблиц, если его нельзя определить автоматически',
-                                 ['Определить автоматически'] + known + ['Другой…'], key='x_region_sel',
-                                 help='Регион таблицы определяется по индексу станции (если она есть в '
-                                      'справочниках станционных файлов) или по имени файла.')
-        x_region = (c1.text_input('Название региона', key='x_region_new') if x_reg_sel == 'Другой…'
-                    else (None if x_reg_sel == 'Определить автоматически' else x_reg_sel))
-        x_mode = c2.radio('При совпадении станции и даты в обоих источниках', ['main', 'tables'], key='x_mode',
-                          format_func={'main': 'Приоритет у файлов станционного формата',
-                                       'tables': 'Приоритет у таблиц Excel/CSV'}.get)
-        rr_layout = c2.selectbox('Раскладка значений в файлах осадков (RR)', ['auto', 'day', 'block'],
-                                 format_func={'auto': 'Определить автоматически',
-                                              'day': 'Ночь, день, сутки по датам',
-                                              'block': 'Блоками по месяцу'}.get)
-
-    def _read(mapping=None, uploads=None):
-        bar = st.progress(0.0, text='Чтение файлов…')
-        test_dir = os.environ.get('CA_TEST_DIR')     # для автоматических тестов программы
-        if not uploads and test_dir:
-            uploads = [(n, open(os.path.join(test_dir, n), 'rb').read()) for n in sorted(os.listdir(test_dir))
-                       if os.path.isfile(os.path.join(test_dir, n))]
-        res = loader.load_all(uploads=uploads,
-                              table_region=x_region, rr_layout=rr_layout, prefer=x_mode, mapping=mapping,
-                              progress=lambda f, n: bar.progress(min(1.0, f), text=f'Чтение: {n}'))
-        bar.empty()
-        if not res['data']:
-            st.error('Данные не найдены: среди загруженных файлов нет файлов станционного формата или таблиц.')
-            return
-        S.raw = res
-        S.x_map = res['mapping']
-        stt = readers.build_station_table(res['index_files'], res['data'])
-        nm = res['table_names']
-        if len(nm):
-            stt['name'] = np.where(stt['name'].astype(str) == stt['st'].astype(str),
-                                   stt['st'].map(nm).fillna(stt['name']), stt['name'])
-        S.stations = numeric_stations(stt)
-        refresh_names()
-        for k in ['checks', 'qc_log', 'clean', 'flags', 'filled', 'fill_log', 'cv', 'D', 'ann', 'events', 'zoning']:
-            S[k] = None
-
-    if st.button('Прочитать данные', type='primary'):
-        if not ups and not os.environ.get('CA_TEST_DIR'):
-            st.error('Загрузите файлы или архивы.')
-        else:
-            try:
-                _read(uploads=[(u.name, u.getvalue()) for u in ups] if ups else None)
-                S.x_uploads = [(u.name, u.getvalue()) for u in ups] if ups else None
-            except Exception as e:
-                st.error(f'Ошибка чтения: {e}')
-    if S.raw:
-        res = S.raw
-        st.subheader('Состав загруженных данных')
-        if 'summary' in res:
-            show_df(res['summary'], 0)
-        nv = pd.DataFrame([{'Переменная': v, 'Станций': d['st'].nunique(), 'Суток': len(d),
-                            'Начало': d['date'].min().strftime('%d.%m.%Y'), 'Конец': d['date'].max().strftime('%d.%m.%Y'),
-                            'Регионы': ', '.join(sorted(d['region'].dropna().astype(str).unique()))}
-                           for v, d in res['data'].items()])
-        show_df(nv, 0)
-        if res.get('compare') is not None and len(res['compare']):
-            st.markdown('**Сверка источников** (совпадающие станции и даты в файлах станционного формата и в таблицах)')
-            show_df(res['compare'], 2)
-            footnote('Средняя абсолютная разность и доля суток, где значения источников расходятся больше чем на '
-                     '0,5 °C (температура) или 0,5 мм (осадки). Заметные расхождения Tмин и Tмакс обычно связаны с '
-                     'разными интервалами определения экстремумов (полусутки или сутки). В объединённый ряд '
-                     'берётся значение источника, выбранного в параметрах чтения; второй дополняет пропуски.')
-        if res.get('tables'):
-            with st.expander('Сопоставление заголовков таблиц с показателями', expanded=False):
-                st.caption('Сопоставление построено автоматически по первой таблице. Если показатель определён '
-                           'неверно, исправьте его и прочитайте данные заново.')
-                opts = ['—'] + [r[2] for r in xlsx_daily.RULES]
-                mp = st.data_editor(S.x_map, hide_index=True, width='stretch', key='x_map_ed',
-                                    column_config={'Показатель': st.column_config.SelectboxColumn(options=opts),
-                                                   'Столбец': st.column_config.NumberColumn(disabled=True),
-                                                   'Заголовок': st.column_config.TextColumn(disabled=True),
-                                                   'Описание': st.column_config.TextColumn(disabled=True)})
-                if st.button('Прочитать заново с этим сопоставлением'):
-                    try:
-                        mp = mp.assign(Описание=mp['Показатель'].map(xlsx_daily.STD_LABEL).fillna('не используется'))
-                        _read(mapping=mp, uploads=S.get('x_uploads'))
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f'Ошибка чтения: {e}')
-        st.subheader('Реестр файлов')
-        show_df(res['files'], 0, height=240)
-        if res['notes']:
-            with st.expander('Замечания при чтении', expanded=False):
-                for n in res['notes']:
-                    st.markdown(f'- {n}')
-        st.subheader('Справочник станций')
-        st.markdown('Координаты нужны для пространственной проверки, интерполяции и карт. Их можно '
-                    'ввести в таблице или загрузить файлом (столбцы: индекс станции, широта, долгота, '
-                    'высота).')
-        coord = st.file_uploader('Файл с координатами (.xlsx, .csv)', type=['xlsx', 'csv'], key='coordfile')
-        if coord is not None:
-            try:
-                from modules import data_io
-                tab = data_io.load_table(coord)
-                if isinstance(tab, dict):
-                    tab = list(tab.values())[0]
-                cmap_ = data_io.guess_station_column_map(tab)
-                u = pd.DataFrame({'st': pd.to_numeric(tab[cmap_['Станция']], errors='coerce')})
-                for k_from, k_to in [('Lat', 'lat'), ('Lon', 'lon'), ('Название', 'name')]:
-                    if cmap_.get(k_from):
-                        u[k_to] = tab[cmap_[k_from]].values
-                alt_col = next((c for c in tab.columns if 'выс' in str(c).lower() or 'alt' in str(c).lower()), None)
-                if alt_col:
-                    u['alt'] = pd.to_numeric(tab[alt_col], errors='coerce').values
-                S.stations = numeric_stations(readers.build_station_table(res['index_files'], res['data'],
-                                                                          u.dropna(subset=['st'])))
-                st.success('Координаты добавлены.')
-            except Exception as e:
-                st.error(f'Не удалось прочитать файл координат: {e}')
-        degmin = st.checkbox('Координаты записаны в формате «градусы.минуты» — пересчитать в десятичные')
-        st.caption('Регионы в данных: ' + ', '.join(f'{r} ({int((S.stations["region"] == r).sum())} ст.)'
-                                                      for r in regions()) +
-                   '. Регион определяется по имени файла (…nsk… — НСО, …omsk… — Омская обл., иначе — '
-                   'буквенная часть имени), для таблиц Excel/CSV — по индексу станции или по параметрам чтения; '
-                   'его можно изменить в таблице.')
-        ed = st.data_editor(numeric_stations(S.stations), width='stretch', hide_index=True, key='st_editor',
-                            column_config={'st': st.column_config.NumberColumn('Индекс', disabled=True, format='%d'),
-                                           'name': 'Название', 'region': 'Регион',
-                                           'lat': st.column_config.NumberColumn('Широта', format='%.2f'),
-                                           'lon': st.column_config.NumberColumn('Долгота', format='%.2f'),
-                                           'alt': st.column_config.NumberColumn('Высота, м', format='%.0f'),
-                                           'vars': st.column_config.TextColumn('Переменные', disabled=True)})
-        if st.button('Сохранить справочник'):
-            ed = ed.copy()
-            if degmin:
-                ed['lat'] = readers.degmin_to_decimal(ed['lat'])
-                ed['lon'] = readers.degmin_to_decimal(ed['lon'])
-            S.stations = numeric_stations(ed)
-            apply_regions()
-            refresh_names()
-            for k in ['checks', 'qc_log', 'clean', 'flags', 'filled', 'fill_log', 'cv', 'D', 'ann', 'events', 'zoning']:
-                S[k] = None
-            st.success('Справочник сохранён. Результаты следующих этапов сброшены — выполните их заново.')
-
-        st.subheader('Границы сезонов по регионам')
-        st.markdown('Сроки сезонов зависят от климата региона и используются при контроле качества, расчёте '
-                    'полноты и показателей. Значения по умолчанию заданы для юга Западной Сибири; для другого '
-                    'региона проверьте и при необходимости измените их.')
-        for rg in regions():
-            P.seasons_for(rg)
-        rows = []
-        for key, lab in P.SEASON_LABELS.items():
-            r = {'Код': key, 'Сезон': lab}
-            for rg in regions():
-                a_, b_ = P.SEASONS[rg][key]
-                r[f'{rg}: начало'] = MONTHS_RU[a_ - 1]
-                r[f'{rg}: окончание'] = MONTHS_RU[b_ - 1]
-            rows.append(r)
-        cc = {'Код': None, 'Сезон': st.column_config.TextColumn(disabled=True, width='large')}
-        for rg in regions():
-            for part in ('начало', 'окончание'):
-                cc[f'{rg}: {part}'] = st.column_config.SelectboxColumn(options=MONTHS_RU, required=True)
-        sez = st.data_editor(pd.DataFrame(rows), hide_index=True, width='stretch', key='season_ed',
-                             column_config=cc)
-        changed = False
-        for _, r in sez.iterrows():
-            for rg in regions():
-                v = (MONTHS_RU.index(r[f'{rg}: начало']) + 1, MONTHS_RU.index(r[f'{rg}: окончание']) + 1)
-                if P.SEASONS[rg][r['Код']] != v:
-                    P.SEASONS[rg][r['Код']] = v
-                    changed = True
-        if changed:
-            for k in ['checks', 'qc_log', 'clean', 'flags', 'filled', 'fill_log', 'cv', 'D', 'ann', 'events', 'zoning']:
-                S[k] = None
-            st.info('Границы сезонов изменены. Результаты следующих этапов сброшены — выполните их заново.')
-        footnote('Сезон, переходящий через новый год (например, ноябрь–март), относится к году окончания: '
-                 'зима 2016/17 г. — 2017 г. Отопительный год используется только для расчёта ГСОП.')
-
-# ═══════════════════════════ 2. ПРОВЕРКА ═════════════════════════════════
-with tabs[1]:
-    st.header('Проверка исходных данных')
-    st.caption('Проверка не меняет данные. Виды проверок — по Руководству по климатологической практике '
-               '(ВМО-№ 100, 2018, раздел 3.3): проверка формата, полноты, согласованности и допустимости.')
-    if not S.raw:
-        st.info('Сначала загрузите данные.')
-    else:
-        data = S.raw['data']
-        if st.button('Выполнить проверку', type='primary'):
-            with st.spinner('Проверка…'):
-                S.checks = {rg: verify.consistency_checks(region_data(data, rg), region_stations(rg))
-                            for rg in regions()}
-                S.comp = verify.completeness(data)
-                S.gaps = verify.network_gaps(data)
-                S.gross = {rg: verify.gross_error_summary(region_data(data, rg)) for rg in regions()}
-        if S.checks is not None:
-            var = st.selectbox('Переменная для карты полноты', sorted(v for v in data if v != 'DY'),
-                               format_func=VAR_LABEL.get, key='comp_var')
-            for rg, tab in region_tabs():
-                with tab:
-                    st.subheader('Проверка формата и согласованности')
-                    chk = S.checks[rg].copy()
-                    chk['Значение'] = chk['Значение'].map(lambda v: (cf(v, 0) if float(v).is_integer() else cf(v, 2))
-                                                          if isinstance(v, (int, float, np.number)) and np.isfinite(v) else v)
-                    st.dataframe(chk.style.apply(
-                        lambda r: ['background-color: #FDECEA' if r['Статус'] == 'ошибка' else
-                                   ('background-color: #FFF4E0' if r['Статус'] == 'внимание' else '') for _ in r],
-                        axis=1), width='stretch', hide_index=True)
-                    save_table(f'table_01_проверка_согласованности_{rg}', S.checks[rg])
-                    footnote('Статус: «норма» — расхождений нет или они в допустимых пределах; «внимание» — есть '
-                             'значения, которые обрабатываются на этапе контроля качества; «ошибка» — вероятно '
-                             'неверное чтение формата (например, иная раскладка значений в строке).')
-                    st.subheader('Проверка полноты')
-                    cr = S.comp[S.comp['Регион'] == rg]
-                    if not cr[cr['Переменная'] == var].empty:
-                        show_fig(charts.completeness_heatmap(cr, var, station_names()), f'fig_полнота_{var}_{rg}')
-                    summ = cr.groupby('Переменная')['Полнота, %'].agg(['mean', 'min']).reset_index()
-                    summ.columns = ['Переменная', 'Средняя полнота, %', 'Наименьшая полнота, %']
-                    show_df(summ, 1)
-                    save_table(f'table_02_полнота_{rg}', cr, 1)
-                    footnote(f'Полнота — доля суток с данными от числа календарных суток года (для класса пожарной опасности FR — '
-                             f'пожароопасный сезон региона, {season_txt(rg, "fire")}). '
-                             'На карте подписаны значения меньше 100 %.')
-                    st.subheader('Пропуски по всей сети региона')
-                    g = S.gaps[S.gaps['Регион'] == rg] if not S.gaps.empty else S.gaps
-                    show_df(g, 1)
-                    save_table(f'table_03_пропуски_по_сети_{rg}', g, 1)
-                    footnote('Периоды, когда данных нет более чем у половины станций региона одновременно. Такие '
-                             'пропуски нельзя восстановить по соседним станциям.')
-                    st.subheader('Проверка допустимости (до очистки)')
-                    show_df(S.gross[rg], 1)
-                    footnote(qc.RULE_HELP['L'])
-
-# ═══════════════════════════ 3. ОЧИСТКА ══════════════════════════════════
-with tabs[2]:
-    st.header('Контроль качества')
-    if not S.raw:
-        st.info('Сначала загрузите данные.')
-    else:
-        data = S.raw['data']
-        with st.expander('Правила и пороги', expanded=False):
-            st.markdown('Пороги по умолчанию — в файле params.py; здесь их можно изменить для текущего расчёта.')
-            c1, c2, c3 = st.columns(3)
-            P.RR_MAX_COLD = c1.number_input('Осадки вне лета: ошибочное, мм за сутки >', value=float(P.RR_MAX_COLD),
-                                            help=qc.RULE_HELP['RR1'])
-            P.RR_MAX_WARM = c1.number_input('Осадки летом: ошибочное, мм за сутки ≥', value=float(P.RR_MAX_WARM))
-            P.NETWORK_MEDIAN_DEV_T = c2.number_input('Отклонение от медианы по сети, °C',
-                                                     value=float(P.NETWORK_MEDIAN_DEV_T), help=qc.RULE_HELP['N'])
-            P.SPATIAL_Z_SUSPECT = c2.number_input('Соседние станции: |z| для «требует проверки»',
-                                                  value=float(P.SPATIAL_Z_SUSPECT), help=qc.RULE_HELP['S'])
-            P.SPATIAL_Z_REJECT = c2.number_input('Соседние станции: |z| для «ошибочное»', value=float(P.SPATIAL_Z_REJECT))
-            P.SPATIAL_MIN_ABS = c2.number_input('Соседние станции: наименьшее расхождение для «ошибочное», °C',
-                                                value=float(P.SPATIAL_MIN_ABS))
-            P.NEIGHBOR_MAX_KM = c3.number_input('Радиус поиска соседних станций, км', value=float(P.NEIGHBOR_MAX_KM))
-            P.FM_ROUND_MIN_STATIONS = int(c3.number_input('Ветер: круглые значения одновременно не менее чем на … станциях',
-                                                          value=int(P.FM_ROUND_MIN_STATIONS), step=1,
-                                                          help=qc.RULE_HELP['FM1']))
-            sp = st.text_input('Периоды повышенной строгости (начало–конец, через «;»)',
-                               value='; '.join(f'{a}–{b}' for a, b in P.STRICT_PERIODS),
-                               help='В эти периоды пороги проверок по соседним станциям и медиане сети умножаются на 0,6 '
-                                    '(например, при известном сбое исходных телеграмм).')
-            try:
-                P.STRICT_PERIODS = [tuple(x.strip().split('–')) for x in sp.split(';') if '–' in x]
-            except Exception:
-                pass
-            sts = S.stations
-            fm_st = st.multiselect('Ветер: станции, где завышенные значения делятся на 10',
-                                   [int(x) for x in sts['st']],
-                                   default=[s for s in P.FM_DIVIDE_BY_10 if s in sts['st'].values],
-                                   format_func=st_label, help=qc.RULE_HELP['FM2'])
-            fm_year = st.number_input('… начиная с года', value=2018, step=1)
-            P.FM_DIVIDE_BY_10 = {s: int(fm_year) for s in fm_st}
-        c1, c2, c3, c4 = st.columns(4)
-        opts = dict(isolation_forest=c1.checkbox('Многомерная проверка TX (Isolation Forest)', value=True,
-                                                 help=qc.RULE_HELP['IF']),
-                    persistence=c2.checkbox('Поиск неизменных значений', value=True, help=qc.RULE_HELP['P']),
-                    correct_sign=c3.checkbox('Исправлять вероятную ошибку знака Tмакс', value=False,
-                                             help=qc.RULE_HELP['TX3']),
-                    fm_kmh_convert=c4.checkbox('Ветер в км/ч пересчитывать в м/с', value=False,
-                                               help=qc.RULE_HELP['FM3']))
-        if st.button('Выполнить контроль качества', type='primary'):
-            bar = st.progress(0.0)
-            S.qc_log = qc.run_qc(data, S.stations, opts, progress=lambda f, n: bar.progress(f, text=f'Проверка: {n}'))
-            bar.empty()
-            S.clean, S.flags = qc.apply_qc(data, S.qc_log)
-            S.filled = None
-        if S.qc_log is not None:
-            log = S.qc_log
-            if log.empty:
-                st.success('Значений, не прошедших проверки, нет.')
-            else:
-                with st.expander('Правила контроля качества и категории значений', expanded=False):
-                    st.markdown('**Категории.** «Ошибочное» — значение исключается из ряда. «Требует проверки» — '
-                                'значение остаётся; по выбранным правилам такие значения можно исключить. '
-                                '«Исправленное» — ошибка известного происхождения устранена (единицы измерения, '
-                                'лишняя цифра, суточный максимум). «Восстановленное» — пропуск заполнен на этапе 4.')
-                    show_df(pd.DataFrame([{'Код': k, 'Правило': qc.RULES[k], 'Пояснение': qc.RULE_HELP.get(k, '')}
-                                          for k in qc.RULES]), 0)
-                sus_rules = sorted(log[log['Действие'] == qc.SUSPECT]['Правило'].unique())
-                rej = st.multiselect('Исключать значения «требует проверки» по правилам', sus_rules,
-                                     format_func=lambda r: f'{r} — {qc.RULES.get(r, r)}')
-                if st.button('Применить'):
-                    S.clean, S.flags = qc.apply_qc(data, log, reject_suspect_rules=rej)
-                    S.filled = None
-                    st.success('Очищенные данные обновлены.')
-                for rg, tab in region_tabs():
-                    with tab:
-                        lr = log[log['Регион'] == rg]
-                        summ = qc.qc_summary(lr)
-                        if summ.empty:
-                            st.success('Значений, не прошедших проверки, нет.')
-                            continue
-                        st.subheader('Сводка')
-                        show_fig(charts.qc_summary_bar(summ), f'fig_контроль_качества_{rg}')
-                        show_df(summ.drop(columns='Регион'), 0)
-                        save_table(f'table_04_контроль_качества_{rg}', summ, 0)
-                        st.subheader('Журнал')
-                        c1, c2, c3 = st.columns(3)
-                        fv = c1.multiselect('Переменная', sorted(lr['Переменная'].unique()), key=f'jv_{rg}')
-                        fa = c2.multiselect('Категория', sorted(lr['Действие'].unique()), key=f'ja_{rg}')
-                        fs = c3.multiselect('Станция', sorted(int(x) for x in lr['Станция'].unique()),
-                                            format_func=st_label, key=f'js_{rg}')
-                        L = lr[lr['Основное']]
-                        if fv:
-                            L = L[L['Переменная'].isin(fv)]
-                        if fa:
-                            L = L[L['Действие'].isin(fa)]
-                        if fs:
-                            L = L[L['Станция'].isin(fs)]
-                        L = L.assign(Название=L['Станция'].map(station_names()))
-                        show_df(L[['Переменная', 'Компонент', 'Станция', 'Название', 'Дата', 'Значение',
-                                   'Новое значение', 'Действие', 'Правило', 'Описание правила', 'Комментарий']]
-                                .rename(columns={'Действие': 'Категория'}), 1, height=320)
-                        save_table(f'table_05_журнал_контроля_качества_{rg}', lr[lr['Основное']].drop(columns='Основное'), 2)
-                        footnote('Если к одному значению применимо несколько правил, в журнале показано одно: '
-                                 'исправленное → ошибочное → требует проверки. Коды правил — в разделе «Правила '
-                                 'контроля качества» выше.')
-                        st.subheader('Ряд станции до и после контроля')
-                        c1, c2, c3 = st.columns(3)
-                        vv = [x for x in ['TX', 'TT', 'RR', 'FM', 'TS', 'RS'] if x in data]
-                        v = c1.selectbox('Переменная', vv, key=f'qc_v_{rg}')
-                        comps = [c for c in qc.VAR_COMPS[v] if c in data[v].columns]
-                        cpt = c2.selectbox('Компонент', comps, format_func=lambda c: COMP_LABEL.get(c, c), key=f'qc_c_{rg}')
-                        cand = [int(x) for x in L[L['Переменная'] == v]['Станция'].value_counts().index]
-                        cand += [int(x) for x in region_stations(rg)['st'] if int(x) not in cand]
-                        sst = c3.selectbox('Станция', cand, format_func=st_label, key=f'qc_s_{rg}')
-                        fig = charts.qc_series(data[v], cpt, sst, log, S.clean[v],
-                                               title=f'{COMP_LABEL.get(cpt, cpt)}: {st_label(sst)}',
-                                               ylabel=readers.VAR_INFO[v]['unit'])
-                        show_fig(fig, f'fig_контроль_{v}_{cpt}_{sst}', wide=True)
-
-# ═══════════════════════════ 4. ПРОПУСКИ ═════════════════════════════════
-with tabs[3]:
-    st.header('Восстановление пропусков')
-    if S.clean is None:
-        st.info('Сначала выполните контроль качества (вкладка 3).')
-    else:
-        st.markdown('Для каждой переменной выберите метод или «по проверке точности». Во втором случае для каждого '
-                    f'региона отдельно из имеющихся значений скрывается {cf(P.FILL_CV_SHARE * 100, 0)} %, они '
-                    'оцениваются каждым методом, и выбирается метод с наименьшей RMSE. Пропуски длиннее '
-                    f'{P.FILL_MAX_GAP_DAYS} суток и сутки без данных на всех соседних станциях не заполняются.')
-        footnote('Методы — по разделу 5.9 «Оценивание данных» ВМО-№ 100: временная интерполяция (короткие разрывы), '
-                 'методы пространственной оценки (регрессия на соседние станции, обратно-взвешенное расстояние, '
-                 'отношение к соседним станциям для осадков и ветра), а также методы машинного обучения '
-                 '(k ближайших соседей, Random Forest), где признаки — значения соседних станций и день года.')
-        opts_m = {'auto': 'По проверке точности', 'none': 'Не восстанавливать', **fill.METHODS}
-        cols = st.columns(6)
-        meth = {}
-        for i, v in enumerate(['TX', 'TT', 'RS', 'TS', 'RR', 'FM']):
-            if v in S.clean:
-                choices = ['auto', 'none'] + (['ratio', 'regress', 'knn', 'rf', 'clim'] if v in ('RR', 'FM')
-                                               else ['interp', 'regress', 'idw', 'knn', 'rf', 'clim'])
-                meth[v] = cols[i].selectbox(v, choices, index=choices.index(fill.DEFAULT_METHODS.get(v, 'auto')),
-                                            format_func=opts_m.get, key=f'fm_{v}')
-        P.FILL_MAX_GAP_DAYS = int(st.number_input('Наибольшая длина восстанавливаемого пропуска, сутки',
-                                                  value=int(P.FILL_MAX_GAP_DAYS), step=5))
-        if st.button('Восстановить пропуски', type='primary'):
-            bar = st.progress(0.0)
-            S.filled, S.fill_log, S.cv = fill.fill_dataset(S.clean, S.stations, meth,
-                                                           progress=lambda f, n: bar.progress(f, text=n))
-            bar.empty()
-        if S.filled is not None:
-            for rg, tab in region_tabs():
-                with tab:
-                    st.subheader('Результат')
-                    fl_r = S.fill_log[S.fill_log['region'] == rg] if 'region' in S.fill_log else S.fill_log
-                    fs = fill.fill_summary(fl_r, S.clean)
-                    show_df(fs.drop(columns='Регион', errors='ignore'), 0)
-                    save_table(f'table_06_восстановление_{rg}', fs, 0)
-                    cv = S.cv[S.cv['Регион'] == rg] if S.cv is not None and 'Регион' in S.cv else S.cv
-                    if cv is not None and not cv.empty:
-                        st.subheader('Проверка точности методов')
-                        show_df(cv.drop(columns=['Ошибка', 'Регион'], errors='ignore'), 2)
-                        save_table(f'table_07_проверка_методов_{rg}', cv, 3)
-                        footnote('MAE — средняя абсолютная ошибка, RMSE — средняя квадратическая ошибка, смещение — '
-                                 'средняя разность «оценка − факт», R² — доля объяснённой дисперсии; все — на '
-                                 'искусственно скрытых значениях. «Восстановлено, %» — доля скрытых значений, '
-                                 'которые метод смог оценить.')
-                        cc = st.selectbox('Компонент', cv['Компонент'].unique(), format_func=lambda c: COMP_LABEL.get(c, c),
-                                          key=f'cvc_{rg}')
-                        show_fig(charts.cv_bars(cv, cc), f'fig_методы_{cc}_{rg}')
-                    st.subheader('Восстановленные значения на графике')
-                    c1, c2, c3 = st.columns(3)
-                    v = c1.selectbox('Переменная', [x for x in ['TX', 'TT', 'RR', 'FM', 'TS', 'RS'] if x in S.filled],
-                                     key=f'f_v_{rg}')
-                    cpt = c2.selectbox('Компонент', [c for c in fill.FILL_COMPS[v] if c in S.filled[v].columns],
-                                       format_func=lambda c: COMP_LABEL.get(c, c), key=f'f_c_{rg}')
-                    fl = fl_r[(fl_r['var'] == v) & (fl_r['comp'] == cpt)]
-                    cand = [int(x) for x in fl['st'].value_counts().index] or [int(x) for x in region_stations(rg)['st']]
-                    sst = c3.selectbox('Станция', cand, format_func=st_label, key=f'f_s_{rg}')
-                    fig = charts.qc_series(S.clean[v], cpt, sst, None, None, fl,
-                                           title=f'{COMP_LABEL.get(cpt, cpt)}: {st_label(sst)}',
-                                           ylabel=readers.VAR_INFO[v]['unit'])
-                    show_fig(fig, f'fig_восстановление_{v}_{cpt}_{sst}', wide=True)
-
-# ═══════════════════════════ 5. ПОКАЗАТЕЛИ ═══════════════════════════════
-with tabs[4]:
-    st.header('Климатические показатели для планов адаптации')
-    data = current_data()
-    if data is None:
-        st.info('Сначала загрузите данные.')
-    else:
-        src = st.radio('Данные для расчёта', ['Восстановленные', 'Очищенные (без восстановления)', 'Исходные'],
-                       horizontal=True, index=0 if S.filled is not None else (1 if S.clean is not None else 2))
-        use = {'Восстановленные': S.filled, 'Очищенные (без восстановления)': S.clean,
-               'Исходные': S.raw['data']}[src]
-        P.DRY_DAY_MM = st.number_input('Порог сухого дня, мм (сутки с осадками меньше порога)',
-                                       value=float(P.DRY_DAY_MM), step=0.1,
-                                       help='1,0 мм — порог индексов ETCCDI (CDD, CWD). Для бездождных периодов по '
-                                            'другим определениям можно задать 0,1 мм.')
-        st.subheader('Критерии опасных и неблагоприятных явлений')
-        new_regions = [rg for rg in regions() if rg not in P.CRITERIA_CHECKED]
-        if new_regions:
-            st.warning('Для регионов ' + ', '.join(new_regions) + ' критерии ОЯ и НЯ заполнены значениями по умолчанию. '
-                       'Введите критерии УГМС этих регионов в таблице ниже.')
-        for rg in regions():
-            P.criteria_for(rg)
-        crit = pd.DataFrame({rg: {k: (f'({cf(v[0], 1)}; {cf(v[1], 1)})' if isinstance(v, tuple) else cf(v, 1))
-                                  for k, v in P.CRITERIA[rg].items()} for rg in regions()})
-        crit.insert(0, 'Критерий', [P.CRITERIA_LABELS.get(k, k) for k in crit.index])
-        crit = crit.reset_index().rename(columns={'index': 'Код'})
-        crit_ed = st.data_editor(crit.astype(str), hide_index=True, width='stretch', key='crit_ed',
-                                 disabled=['Код', 'Критерий'])
-        try:
-            for rg in regions():
-                for _, r in crit_ed.iterrows():
-                    raw = str(r[rg]).strip()
-                    if raw.startswith('('):
-                        nums = re.findall(r'-?\d+(?:[.,]\d+)?', raw.replace(', ', ' '))
-                        P.CRITERIA[rg][r['Код']] = tuple(float(x.replace(',', '.')) for x in nums)
-                    else:
-                        P.CRITERIA[rg][r['Код']] = float(raw.replace(',', '.'))
-        except Exception:
-            st.warning('Критерии не приняты: проверьте формат чисел (диапазон — в скобках, например «(30,0; 34,9)»).')
-        if use is None:
-            st.warning('Выбранный набор данных ещё не сформирован.')
-        elif st.button('Рассчитать показатели', type='primary'):
-            with st.spinner('Расчёт…'):
-                hum = None
-                if 'TT' in use and 'RS' in use:
-                    hum = derived.daily_humidity(derived.build_terms(use['TT'], use['RS']))
-                D = indices.build_daily(use, hum)
-                S.D = D
-                S.ann = indices.annual_indices(D)
-                S.events = dict(heat=indices.heat_events(D), cold=indices.cold_events(D),
-                                precip=indices.heavy_precip_events(D) if 'rr_n' in D else pd.DataFrame(),
-                                drought=indices.drought_events(D) if 'rr_s' in D else pd.DataFrame(),
-                                sukh=indices.sukhovey_events(D))
-        if S.ann is not None:
-            ann, D = S.ann, S.D
-            with st.expander('Определения показателей и источники'):
-                show_df(pd.DataFrame([{'Показатель': indices.label(c), 'Определение': h}
-                                      for c, h in indices.INDEX_HELP.items()]), 0)
-                for r in indices.REFERENCES:
-                    st.markdown(f'- {r}')
-            groups = sorted({v[2] for v in indices.INDEX_INFO.values()})
-            grp = st.multiselect('Группы показателей в таблицах', groups,
-                                 default=[g for g in ['Жара', 'Осадки', 'Засуха', 'Агроклимат'] if g in groups])
-            code = st.selectbox('Показатель для графика межгодового хода', sorted(ann['Показатель'].unique()),
-                                format_func=indices.label)
-            for rg, tab in region_tabs():
-                with tab:
-                    a = ann[ann['region'] == rg]
-                    Dr = D[D['region'] == rg]
-                    if a.empty:
-                        st.info('Нет лет с достаточной полнотой данных.')
-                        continue
-                    yrs = (int(a['year'].min()), int(a['year'].max()))
-                    st.caption(f'Годы с достаточной полнотой: {yrs[0]}–{yrs[1]}. Год учитывается, если доступно '
-                               '≥ 90 % суточных значений нужной переменной.')
-                    per = st.slider('Период осреднения', yrs[0], yrs[1], yrs, key=f'ind_period_{rg}') \
-                        if yrs[0] < yrs[1] else yrs
-                    sm = indices.station_means(a, per)
-                    sm = S.stations[['st', 'name']].merge(sm, on='st')
-                    codes = [c for c, v in indices.INDEX_INFO.items() if v[2] in grp and c in sm.columns]
-                    tab_ = sm[['st', 'name', 'Лет'] + codes].rename(columns={**{c: indices.label(c) for c in codes},
-                                                                           'st': 'Станция', 'name': 'Название'})
-                    st.subheader('Средние многолетние значения по станциям')
-                    show_df(tab_, 1, height=330)
-                    save_table(f'table_08_показатели_по_станциям_{rg}', tab_, 2)
-                    rm = a[a['year'].between(*per)].groupby('Показатель')['Значение'].agg(['mean', 'min', 'max'])
-                    rm = rm.reindex([c for c in indices.INDEX_INFO if c in rm.index])
-                    rm.index = [indices.label(c) for c in rm.index]
-                    rm.columns = ['Среднее по станциям', 'Наименьшее', 'Наибольшее']
-                    st.subheader('Сводка по региону')
-                    show_df(rm.reset_index().rename(columns={'index': 'Показатель'}), 2, height=300)
-                    save_table(f'table_09_показатели_регион_{rg}', rm.reset_index().rename(columns={'index': 'Показатель'}), 2)
-                    footnote('Среднее — по годовым значениям всех станций региона за выбранный период; наименьшее и '
-                             'наибольшее — по отдельным годам и станциям.')
-                    st.subheader('Межгодовой ход')
-                    if code in a['Показатель'].values:
-                        show_fig(charts.index_series(a, code, indices.label(code)), f'fig_ряд_{code}_{rg}')
-                        footnote('Линия — среднее по станциям региона; пунктир — наклон Сена; * — тренд значим по тесту '
-                                 'Манна — Кендалла (p < 0,05). Для рядов короче 30 лет оценка предварительная (ВМО).')
-                    st.subheader('Аномально жаркая погода и сильная жара')
-                    ev = S.events['heat']
-                    ev = ev[ev['region'] == rg] if not ev.empty else ev
-                    c1, c2 = st.columns(2)
-                    pa = c1.slider('Период 1', yrs[0], yrs[1], yrs, key=f'hp1_{rg}') if yrs[0] < yrs[1] else yrs
-                    pb = c2.slider('Период 2 (необязательно)', yrs[0], yrs[1], yrs, key=f'hp2_{rg}') \
-                        if yrs[0] < yrs[1] else yrs
-                    recs = {}
-                    for pp in ([pa] if pa == pb else [pa, pb]):
-                        r = indices.heat_summary(ev, Dr, pp, rg)
-                        recs[f'{r.pop("Период")} гг.'] = r
-                    hs = pd.DataFrame(recs)
-                    hs.index.name = 'Характеристика'
-                    hs = hs.reset_index()
-                    with st.expander('Базовые значения для сравнения (например, по ранее выполненным расчётам)'):
-                        base = st.data_editor(pd.DataFrame({'Характеристика': hs['Характеристика'],
-                                                            'Базовый период': [None] * len(hs)}),
-                                              hide_index=True, width='stretch', key=f'base_heat_{rg}')
-                        if base['Базовый период'].notna().any():
-                            hs = hs.merge(base, on='Характеристика')
-                    show_df(hs, 2)
-                    save_table(f'table_10_жара_{rg}', hs, 2)
-                    crit_r = P.criteria_for(rg)
-                    footnote(f'АЖ — Tмакс ≥ {cf(crit_r["АЖ_порог"], 0)} °C не менее {crit_r["АЖ_дней"]} суток подряд; '
-                             f'СЖ — Tмакс ≥ {cf(crit_r["СЖ_порог"], 0)} °C не менее {crit_r["СЖ_дней"]} суток подряд '
-                             '(критерии региона, таблица выше). Пропуск данных прерывает период.')
-                    with st.expander('Перечень периодов АЖ и СЖ'):
-                        show_df(ev.assign(Название=ev['st'].map(station_names())), 1, height=260)
-                        save_table(f'table_11_периоды_жары_{rg}', ev, 1)
-                    st.subheader('Бездождные периоды и периоды без снегопада')
-                    ps = st.slider('Период', yrs[0], yrs[1], yrs, key=f'dp_{rg}') if yrs[0] < yrs[1] else yrs
-                    Dp = Dr[Dr['date'].dt.year.between(ps[0] - 1, ps[1])]
-                    for season, kind, ttl in [('тёплый', 'dry', f'Бездождные периоды, тёплый сезон ({season_txt(rg, "warm")})'),
-                                              ('холодный', 'dry', f'Бездождные периоды, холодный сезон ({season_txt(rg, "cold")})'),
-                                              ('холодный', 'nosnow', f'Периоды без снегопада, холодный сезон ({season_txt(rg, "cold")})')]:
-                        spl, ok = indices.dry_spells(Dp, season, kind=kind)
-                        if ok.empty:
-                            continue
-                        ok = ok[ok['Сезон'].between(*ps)]
-                        spl = spl[spl['Сезон'].between(*ps)] if not spl.empty else spl
-                        by_st, by_reg = indices.spell_class_table(spl, ok)
-                        st.markdown(f'**{ttl}.** Учтено сезонов: {int(ok["Учтён"].sum())} из {len(ok)}.')
-                        if not by_reg.empty:
-                            show_df(by_reg.drop(columns='region'), 2)
-                            show_fig(charts.spell_classes_bar(by_reg, ttl), f'fig_{kind}_{season}_{rg}')
-                            save_table(f'table_12_{kind}_{season}_{rg}', by_reg, 2)
-                            with st.expander('По станциям'):
-                                show_df(by_st.assign(Название=by_st['st'].map(station_names())), 2)
-                    footnote(f'Сухой день — осадки < {cf(P.DRY_DAY_MM, 1)} мм. Период относится к сезону, в котором '
-                             'начался; холодный сезон обозначен годом окончания (зима 2016/17 г. — 2017 г.). Сезон с '
-                             f'пропусками > {cf(P.SEASON_MAX_MISSING * 100, 0)} % исключается. День со снегопадом — '
-                             f'осадки ≥ порога сухого дня при Tмакс ≤ {cf(P.SNOW_TMAX, 0)} °C.')
-                    st.subheader('Опасные явления: перечни')
-                    for k, ttl in [('precip', 'Сильные осадки и снег'),
-                                   ('cold', 'Сильный мороз, аномально холодная погода'),
-                                   ('drought', 'Атмосферная засуха'), ('sukh', 'Суховеи')]:
-                        e = S.events.get(k)
-                        e = e[e['region'] == rg] if e is not None and len(e) else e
-                        with st.expander(f'{ttl}: {0 if e is None else len(e)} случаев'):
-                            if e is not None and len(e):
-                                show_df(e.assign(Название=e['st'].map(station_names())), 1, height=240)
-                                save_table(f'table_13_события_{k}_{rg}', e, 1)
-                    st.subheader('Экстремумы и повторяемость')
-                    ext = indices.extremes_table(Dr[Dr['year'].between(*per)], a[a['year'].between(*per)])
-                    ext = S.stations[['st', 'name']].merge(ext, on='st').drop(columns='region')
-                    show_df(ext, 1, height=260)
-                    save_table(f'table_14_экстремумы_{rg}', ext, 1)
-                    footnote(f'Tмакс 0,95 обеспеченности — 95-й процентиль суточной Tмакс за летние месяцы ({season_txt(rg, "summer")}). Уровни «раз в N '
-                             'лет» — по распределению Гумбеля для годовых максимумов (метод моментов); число случаев АЖ, '
-                             'возможное раз в 50 лет, — по распределению Пуассона. При длине ряда < 30 лет оценки '
-                             'приближённые.')
-
-# ═══════════════════════════ 6. ТРЕНДЫ ═══════════════════════════════════
-with tabs[5]:
-    st.header('Тренды и сравнение периодов')
-    if S.ann is None:
-        st.info('Сначала рассчитайте показатели (вкладка 5).')
-    else:
-        ann = S.ann
-        codes = st.multiselect('Показатели', sorted(ann['Показатель'].unique()), format_func=indices.label,
-                               default=[c for c in ['Tср_год', 'TXx', 'SU30', 'АЖ_случаев', 'PRCPTOT', 'CDD', 'RX1day',
-                                                    'Сумма10', 'ГТК'] if c in ann['Показатель'].unique()])
-        by = st.radio('Уровень', ['region', 'st'], format_func={'region': 'Средние по региону', 'st': 'По станциям'}.get,
-                      horizontal=True)
-        footnote('Наклон Сена — изменение за 10 лет; тест Манна — Кендалла с поправкой Хамеда — Рао на автокорреляцию '
-                 '(p < 0,05 — тренд значим); тест Петтитта — год наиболее вероятной смены среднего уровня ряда. По '
-                 'рекомендации ВМО выводы о трендах делаются по рядам не короче 30 лет.')
-        for rg, tab in region_tabs():
-            with tab:
-                a = ann[ann['region'] == rg]
-                tt = trends.trend_table(a, codes, by=by)
-                if not tt.empty:
-                    tt['Показатель'] = tt['Показатель'].map(indices.label)
-                    if by == 'st':
-                        tt.insert(1, 'Название', tt['Станция'].map(station_names()))
-                    show_df(tt.drop(columns='Регион', errors='ignore'), 3)
-                    save_table(f'table_15_тренды_{rg}', tt, 3)
-                else:
-                    st.info('Ряды короче 5 лет — тренды не оцениваются.')
-                yrs = (int(a['year'].min()), int(a['year'].max())) if not a.empty else (0, 0)
-                if yrs[1] - yrs[0] < 5:
-                    continue
-                st.subheader('Сравнение периодов')
-                c1, c2 = st.columns(2)
-                p1 = c1.slider('Период 1', yrs[0], yrs[1], (yrs[0], (yrs[0] + yrs[1]) // 2), key=f'cp1_{rg}')
-                p2 = c2.slider('Период 2', yrs[0], yrs[1], ((yrs[0] + yrs[1]) // 2 + 1, yrs[1]), key=f'cp2_{rg}')
-                cmp = trends.compare_periods(a, p1, p2, codes, by='region')
-                if not cmp.empty:
-                    code0 = st.selectbox('Показатель для графика', codes, format_func=indices.label, key=f'cmpc_{rg}')
-                    fig = charts.period_compare_bar(cmp, code0, indices.label(code0))
-                    cmp['Показатель'] = cmp['Показатель'].map(indices.label)
-                    show_df(cmp.drop(columns='Регион', errors='ignore'), 3)
-                    save_table(f'table_16_сравнение_периодов_{rg}', cmp, 3)
-                    footnote('Разность — среднее периода 2 минус среднее периода 1; 95 % доверительный интервал — '
-                             'бутстреп (2000 повторов); p — критерий Манна — Уитни.')
-                    if fig:
-                        show_fig(fig, f'fig_периоды_{code0}_{rg}')
-
-# ═══════════════════════════ 7. РАЙОНИРОВАНИЕ ════════════════════════════
-with tabs[6]:
-    st.header('Районирование по климатическим показателям')
-    if S.ann is None:
-        st.info('Сначала рассчитайте показатели (вкладка 5).')
-    else:
-        ann = S.ann
-        rg = st.selectbox('Регион', regions(), key='z_region')
-        a = ann[ann['region'] == rg]
-        yrs = (int(a['year'].min()), int(a['year'].max()))
-        per = st.slider('Период осреднения', yrs[0], yrs[1], yrs, key='z_per') if yrs[0] < yrs[1] else yrs
-        sm = indices.station_means(a, per)
-        base = S.stations[['st', 'name', 'region', 'lat', 'lon', 'alt']].merge(sm.drop(columns='region'), on='st')
-        base = base[base['region'] == rg].reset_index(drop=True)
-        feats_all = [c for c in indices.INDEX_INFO if c in base.columns and base[c].notna().sum() >= 3
-                     and base[c].std() > 0]
-        default = [c for c in ['SU30', 'АЖ_случаев', 'Сумма10', 'ГТК', 'PRCPTOT', 'CDD', 'R10mm', 'Ветер15', 'Пож4',
-                               'FD'] if c in feats_all]
-        feats = st.multiselect('Показатели для районирования', feats_all, default=default, format_func=indices.label)
-        if len(base) < 4:
-            st.warning('Для районирования нужно не менее 4 станций с данными.')
-        elif len(feats) < 2:
-            st.warning('Выберите минимум 2 показателя.')
-        else:
-            corr = base[feats].corr()
-            hi = [(x, y, corr.loc[x, y]) for i, x in enumerate(feats) for y in feats[i + 1:] if abs(corr.loc[x, y]) > 0.9]
-            if hi:
-                footnote('Сильно связанные показатели (|r| > 0,9), один из пары можно исключить: ' +
-                         '; '.join(f'{indices.label(x)} — {indices.label(y)} ({cf(r, 2)})' for x, y, r in hi))
-            dc, Xs, _ = clustering.prepare_matrix(base, feats)
-            st.caption(f'Станций с полными значениями: {len(dc)} из {len(base)}')
-            kmax = max(3, min(7, len(dc) - 1))
-            sil = clustering.silhouette_by_k(Xs, range(2, kmax))
-            ari = clustering.ari_by_k(Xs, dc['lat'].values, range(2, kmax)) if dc['lat'].notna().all() else None
-            kbest = clustering.best_k(clustering.combined_scores(sil, ari) if ari else sil)
-            c1, c2, c3 = st.columns(3)
-            k = c1.number_input('Число районов (k)', 2, kmax - 1 if kmax > 2 else 2, int(kbest or 2))
-            alg = c2.selectbox('Алгоритм', ['kmeans', 'hierarchical', 'gmm'],
-                               format_func={'kmeans': 'k-средних', 'hierarchical': 'Иерархический (Уорд)',
-                                            'gmm': 'Смесь гауссовых распределений'}.get)
-            order = c3.selectbox('Нумерация районов по убыванию', feats, format_func=indices.label)
-            show_fig(viz.k_selection_plot(sil, ari, chosen_k=k, title='Выбор числа районов'), f'fig_выбор_k_{rg}')
-            footnote('Силуэт — согласованность станций внутри районов (от −1 до 1, больше — лучше); ARI — согласие с '
-                     'делением по широте. Алгоритмы и критерии — как в программе климатического районирования '
-                     f'([{ZONING_URL}]({ZONING_URL})).')
-            labels, s_ = clustering.run_clustering(Xs, int(k), algorithm=alg)
-            dc = dc.copy()
-            dc['Кластер'] = clustering.relabel_clusters_by_feature(dc, labels, order)
-            S.zoning = dict(df=dc, feats=feats, k=int(k), sil=s_, period=per, region=rg)
-            st.success(f'Районирование выполнено: k = {int(k)}, силуэт = {cf(s_, 3)}.')
-            out = dc[['st', 'name', 'Кластер'] + feats].rename(
-                columns={**{c: indices.label(c) for c in feats}, 'st': 'Станция', 'name': 'Название', 'Кластер': 'Район'})
-            show_df(out, 2)
-            save_table(f'table_17_районирование_{rg}', out, 2)
-            summ = clustering.cluster_summary_table(dc, feats, 'Кластер')
-            summ.columns = [c.replace(c.split(' (')[0], indices.label(c.split(' (')[0])) if ' (' in c else c
-                            for c in summ.columns]
-            show_df(summ, 2)
-            save_table(f'table_18_характеристика_районов_{rg}', summ, 2)
-            Xp, pm, ev = clustering.pca_transform(Xs)
-            show_fig(viz.pca_biplot(Xp, pm, dc['Кластер'].values, [indices.label(f).split(',')[0] for f in feats], ev,
-                                    title='Главные компоненты: станции и показатели'), f'fig_pca_{rg}')
-            Z = clustering.hierarchical_linkage(Xs)
-            show_fig(viz.dendrogram_plot(Z, dc['name'].astype(str).str[:12].tolist(), title='Дендрограмма (Уорд)'),
-                     f'fig_дендрограмма_{rg}', wide=True)
-
-# ═══════════════════════════ 8. КАРТЫ ════════════════════════════════════
-@st.fragment
-def maps_tab():
-    """Вкладка карт выполняется отдельно: изменение её настроек не пересчитывает остальные вкладки."""
-    st.header('Карты')
-    stx = stations_xy()
-    if stx is None or stx.empty:
-        st.info('Нужны координаты станций (вкладка 1).')
-    else:
+def size_and_color_controls(key_prefix, default_size='Компактный (8×5)', with_color=True):
+    """Универсальная панель настройки графика: размер, цвет, легенда."""
+    with st.expander('⚙️ Настройки графика (размер, цвет, легенда)'):
         c1, c2, c3 = st.columns(3)
-        kind = c1.selectbox('Вид карты', ['Схематическая', 'По административным районам', 'Физическая',
-                                          'На растровой подложке', 'Интерактивная'],
-                            help='Схематическая — граница и станции с полигонами Тиссена или изолиниями; по районам — '
-                                 'заливка административных районов; физическая — рельеф, реки и озёра; на подложке — '
-                                 'растровая топографическая или физическая карта; интерактивная — для просмотра.')
-        rg = c2.selectbox('Регион', [r for r in regions() if r in set(stx['region'])], key='map_region')
-        regs_ne = basemap.region_names()
-        guess = P.REGION_NE.get(rg) or next((n for n in regs_ne if str(rg).lower()[:4] in n.lower()), None)
-        terr = c3.multiselect('Граница субъекта на карте', regs_ne, default=[guess] if guess in regs_ne else [],
-                              help='Для региона, которого нет в списке соответствий, выберите субъект вручную.')
-        rgeom = basemap.region_geometry(terr) if terr else None
-        if S.get('districts_all') and S.get('districts_region') != rg:
-            S.districts_all, S.districts = None, None       # районы другого региона не используются
-        if S.get('districts_all'):
-            if st.checkbox('Граница субъекта — по загруженным районам OpenStreetMap (точнее встроенной)',
-                           value=True, key='osm_border'):
-                from shapely.ops import unary_union
-                rgeom = unary_union([p['geometry'] for p in S.districts_all]).buffer(0)
-        sdf = stx[stx['region'] == rg].copy()
-        bbox = basemap.bbox_of(rgeom, pad=0.04) if rgeom is not None else basemap.bbox_of(lat=sdf['lat'], lon=sdf['lon'])
-        what_opts = ['Только станции']
-        if S.zoning is not None and S.zoning.get('region') == rg:
-            what_opts.append('Районы-кластеры')
-        if S.ann is not None:
-            what_opts.append('Показатель')
-        what = st.radio('Что показать', what_opts, horizontal=True, index=len(what_opts) - 1 if len(what_opts) > 1 else 0)
-        value_col, cluster_col, vlabel, dec, per = None, None, '', 1, None
-        if what == 'Районы-кластеры':
-            sdf = sdf.merge(S.zoning['df'][['st', 'Кластер']], on='st')
-            cluster_col = 'Кластер'
-        elif what == 'Показатель':
-            a = S.ann[S.ann['region'] == rg]
-            yrs = (int(a['year'].min()), int(a['year'].max()))
-            cc1, cc2 = st.columns(2)
-            code = cc1.selectbox('Показатель', sorted(a['Показатель'].unique()), format_func=indices.label, key='map_code')
-            per = cc2.slider('Период осреднения', yrs[0], yrs[1], yrs, key='map_per') if yrs[0] < yrs[1] else yrs
-            sm = indices.station_means(a, per)[['st', code]]
-            sdf = sdf.merge(sm, on='st').dropna(subset=[code])
-            value_col, vlabel = code, indices.label(code)
-            dec = 0 if indices.INDEX_INFO.get(code, ('', ''))[1] in ('дни', 'случаи', 'день года', '°C·сут') else 1
-            dec = st.number_input('Знаков после запятой', 0, 3, dec)
-        labels_on = st.checkbox('Подписи станций', value=True)
-        title = st.text_input('Заголовок', value=(vlabel.split(',')[0] + (f', {per[0]}–{per[1]} гг.' if per else '')
-                                                  if value_col else ('Климатическое районирование' if cluster_col
-                                                                     else 'Метеостанции')))
-        field, grid = None, None
-        if value_col and len(sdf) >= 4:
-            im = st.selectbox('Интерполяция между станциями', ['rk', 'idw', 'nearest'],
-                              format_func={'rk': 'Регрессионный кригинг (широта, долгота, высота)', 'idw': 'IDW',
-                                           'nearest': 'Ближайшая станция (Тиссен)'}.get,
-                              help='Регрессионный кригинг: линейная регрессия показателя на широту, долготу и высоту '
-                                   '(если загружен рельеф), затем обычный кригинг остатков. IDW — обратно-взвешенное '
-                                   'расстояние.')
-            step = st.select_slider('Шаг сетки, °', [0.02, 0.05, 0.1], value=0.05)
-            LON, LAT = interp.make_grid(bbox, step)
-            galt, alt = None, None
-            if S.dem is not None and im == 'rk' and sdf['alt'].notna().all():
-                galt = basemap.sample_dem(S.dem[0], S.dem[1], LAT.ravel(), LON.ravel()).reshape(LAT.shape)
-                alt = sdf['alt'].values
-            if im == 'rk':
-                field, info = interp.regression_kriging(sdf['lat'], sdf['lon'], sdf[value_col], LAT, LON, alt=alt, galt=galt)
-                footnote(f'Доля дисперсии, объяснённая регрессией: R² = {cf(info["r2_trend"], 2)}'
-                         f'{" (с высотой по ЦМР)" if info["use_alt"] else " (без высоты: для её учёта загрузите рельеф)"}.')
-            elif im == 'idw':
-                field = interp.idw(sdf['lat'], sdf['lon'], sdf[value_col], LAT, LON)
+        with c1:
+            size_label = st.selectbox('Размер', list(CHART_SIZE_PRESETS.keys()),
+                                       index=list(CHART_SIZE_PRESETS.keys()).index(default_size),
+                                       key=f'{key_prefix}_size')
+            custom = st.checkbox('Свой размер', key=f'{key_prefix}_custom_size')
+            if custom:
+                w = st.slider('Ширина, дюймы', 4, 20, CHART_SIZE_PRESETS[size_label][0],
+                               key=f'{key_prefix}_w')
+                h = st.slider('Высота, дюймы', 3, 16, CHART_SIZE_PRESETS[size_label][1],
+                               key=f'{key_prefix}_h')
+                figsize = (w, h)
             else:
-                field = interp.nearest(sdf['lat'], sdf['lon'], sdf[value_col], LAT, LON)
-            # поле считается по всему охвату карты; на картах заливка обрезается точно по границе субъекта
-            grid = (LON, LAT)
-            with st.expander('Проверка интерполяции (поочерёдное исключение станций)'):
-                cvt = interp.loo_cv(sdf['lat'], sdf['lon'], sdf[value_col],
-                                    alt=sdf['alt'].values if sdf['alt'].notna().all() else None)
-                show_df(cvt, 2)
-                footnote('Каждая станция по очереди исключается, её значение оценивается по остальным; MAE, RMSE, R² '
-                         '— по этим оценкам.')
-        # ── субъект в OpenStreetMap: выбирается из списка, запросы — по идентификатору ──
-        osm_rel = None
-        need_osm = kind in ('Схематическая', 'По административным районам', 'Физическая')
-        with st.expander('Субъект и административные районы по данным OpenStreetMap',
-                         expanded=kind == 'По административным районам'):
-            st.caption('Список субъектов запрашивается в OpenStreetMap по охвату станций региона, поэтому название '
-                       'выбирается, а не вводится вручную. Границы районов загружаются по идентификатору субъекта.')
-            ok_key = f'osm_subj_{rg}'
-            if st.button('Получить список субъектов из OpenStreetMap', key='btn_osm_subj'):
+                figsize = CHART_SIZE_PRESETS[size_label]
+        color = None
+        with c2:
+            if with_color:
+                use_custom_color = st.checkbox('Свой цвет', key=f'{key_prefix}_custom_color')
+                if use_custom_color:
+                    color = st.color_picker('Цвет', PALETTE[0], key=f'{key_prefix}_color')
+                else:
+                    color_name = st.selectbox('Цвет из палитры',
+                                               [f'Цвет {i+1}' for i in range(len(PALETTE))],
+                                               key=f'{key_prefix}_palette_color')
+                    color = PALETTE[int(color_name.split()[-1]) - 1]
+        with c3:
+            legend_loc = st.selectbox('Позиция легенды', list(viz.LEGEND_LOC_OPTIONS.keys()),
+                                       key=f'{key_prefix}_legend')
+    return figsize, color, legend_loc
+
+
+def show_caption(chart_key):
+    title, desc = viz.CHART_DESCRIPTIONS[chart_key]
+    st.markdown(f'**{title}.** {desc}')
+
+
+def show_plot(fig, width_frac=0.62):
+    """
+    Показывает график в колонке ограниченной ширины, а не на весь экран —
+    удобнее для восприятия при широком layout='wide'.
+    """
+    col, _ = st.columns([width_frac, 1 - width_frac])
+    with col:
+        st.pyplot(fig, use_container_width=True)
+
+
+def subsample_selector(ld, key):
+    """
+    Выпадающий список подвыборок (периодов), сформированных во вкладке
+    "Подвыборки и периоды". Возвращает отфильтрованный по годам DataFrame.
+    Если подвыборок ещё нет — возвращает исходный ld без изменений.
+    """
+    if not st.session_state.subsamples:
+        return ld, 'Весь период (по умолчанию)'
+    names = list(st.session_state.subsamples.keys())
+    name = st.selectbox('Подвыборка (период)', names, key=key)
+    y1, y2 = st.session_state.subsamples[name]
+    return ld[(ld['Год'] >= y1) & (ld['Год'] <= y2)], name
+
+
+def download_row(fig, base_name, key_prefix):
+    c1, c2 = st.columns(2)
+    with c1:
+        st.download_button('📥 Сохранить PNG', viz.fig_to_bytes(fig, 'png'),
+                            file_name=f'{base_name}.png', key=f'{key_prefix}_png')
+    with c2:
+        st.download_button('📥 Сохранить PDF', viz.fig_to_bytes(fig, 'pdf'),
+                            file_name=f'{base_name}.pdf', key=f'{key_prefix}_pdf')
+
+
+def bbox_filter_controls(polygons, d_clean, key_prefix):
+    """
+    UI-блок обрезки полигонов по прямоугольнику координат. По умолчанию
+    предлагает границы с запасом вокруг станций текущего набора данных.
+    Возвращает обрезанный список полигонов.
+    """
+    with st.expander('✂️ Обрезать по прямоугольнику координат (если полигонов слишком много)'):
+        lat_min_d, lat_max_d = float(d_clean['Lat'].min()), float(d_clean['Lat'].max())
+        lon_min_d, lon_max_d = float(d_clean['Lon'].min()), float(d_clean['Lon'].max())
+        pad_lat = (lat_max_d - lat_min_d) * 0.3 + 0.5
+        pad_lon = (lon_max_d - lon_min_d) * 0.3 + 0.5
+        use_bbox = st.checkbox('Включить обрезку', value=False, key=f'{key_prefix}_use_bbox')
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            lon_min = st.number_input('Долгота от', value=round(lon_min_d - pad_lon, 2),
+                                       key=f'{key_prefix}_lon_min')
+        with c2:
+            lon_max = st.number_input('Долгота до', value=round(lon_max_d + pad_lon, 2),
+                                       key=f'{key_prefix}_lon_max')
+        with c3:
+            lat_min = st.number_input('Широта от', value=round(lat_min_d - pad_lat, 2),
+                                       key=f'{key_prefix}_lat_min')
+        with c4:
+            lat_max = st.number_input('Широта до', value=round(lat_max_d + pad_lat, 2),
+                                       key=f'{key_prefix}_lat_max')
+        if use_bbox:
+            cropped = mapping.filter_polygons_by_bbox(polygons, lon_min, lon_max, lat_min, lat_max)
+            st.info(f'После обрезки осталось полигонов: {len(cropped)} из {len(polygons)}')
+            return cropped
+    return polygons
+
+
+def build_district_assignment_table(assigned):
+    """
+    Таблица район→кластер: сверху районы, где кластер определён по станциям
+    внутри границ (отсортированы по числу станций, потом по имени), затем —
+    районы без станций, где кластер присвоен по ближайшей станции. Каждая
+    строка поясняет, каким способом определён кластер.
+    """
+    rows = []
+    for a in assigned:
+        has_stations = a['n_stations_inside'] > 0
+        method = ('По станциям внутри района' if has_stations
+                  else 'По ближайшей станции (в границах района станций нет)')
+        rows.append({
+            'Район': a['name'], 'Кластер': a['cluster'],
+            'Станций внутри': a['n_stations_inside'],
+            'Способ определения кластера': method,
+            '_has_stations': has_stations,
+        })
+    df = pd.DataFrame(rows)
+    df = df.sort_values(['_has_stations', 'Станций внутри', 'Район'],
+                         ascending=[False, False, True]).drop(columns='_has_stations')
+    return df.reset_index(drop=True)
+
+
+# =============================================================================
+# ВКЛАДКА 1: ДАННЫЕ
+# =============================================================================
+with tab_data:
+    st.header('Загрузка данных')
+    st.markdown(
+        'Загрузите один или несколько файлов: обычно нужны отдельные наборы '
+        '**температуры** и **осадков**, и по желанию — **справочник станций** '
+        '(код станции, название, регион, широта/долгота — для карты).'
+    )
+
+    uploaded_files = st.file_uploader(
+        'Файлы (.xlsx, .csv) — можно выбрать несколько сразу',
+        type=['xlsx', 'xls', 'csv'], accept_multiple_files=True)
+
+    if uploaded_files:
+        for f in uploaded_files:
+            with st.expander(f'📄 {f.name}', expanded=True):
                 try:
-                    with st.spinner('Запрос к Overpass API…'):
-                        S[ok_key] = mapping.list_osm_subjects(basemap.bbox_of(lat=sdf['lat'], lon=sdf['lon'], pad=0.05))
-                except basemap.ServiceError as e:
-                    st.error(str(e))
+                    loaded = data_io.load_table(f)
                 except Exception as e:
-                    st.error(f'Список субъектов не получен: {e}')
-            subj = S.get(ok_key)
-            if subj is not None and len(subj):
-                names = list(subj['name'])
-                g0 = (terr[0] if terr else str(rg)).lower()
-                stem = g0.split()[0][:5]
-                default = next((i for i, n in enumerate(names) if n.lower() == g0), None)
-                if default is None:
-                    default = next((i for i, n in enumerate(names) if stem and stem in n.lower()), 0)
-                osm_name = st.selectbox('Субъект в OpenStreetMap', names, index=default, key=f'osm_name_{rg}')
-                osm_rel = int(subj.loc[subj['name'] == osm_name, 'id'].iloc[0])
-                cc1, cc2 = st.columns(2)
-                al = cc1.selectbox('Уровень административного деления', [6, 8], key='d_al',
-                                   format_func={6: 'Муниципальные районы и округа (admin_level 6)',
-                                                8: 'Поселения (admin_level 8)'}.get)
-                if cc2.button('Загрузить районы субъекта'):
-                    try:
-                        with st.spinner('Запрос к Overpass API (при первой загрузке до 2 минут)…'):
-                            S.districts_all = mapping.fetch_osm_districts(osm_rel, admin_level=int(al))
-                        S.districts = list(S.districts_all)
-                        S.districts_region = rg
-                        st.success(f'Загружено районов: {len(S.districts_all)}.')
-                    except basemap.ServiceError as e:
-                        st.error(str(e))
-                    except Exception as e:
-                        st.error(str(e))
-            elif subj is not None:
-                st.warning('В охвате станций не найдено субъектов OpenStreetMap.')
-            gj = st.file_uploader('или свой файл границ районов (GeoJSON)', type=['geojson', 'json'])
-            if gj is not None:
-                S.districts_all = mapping.read_geojson_file(gj.getvalue())
-                S.districts = list(S.districts_all)
-                S.districts_region = rg
-            if S.get('districts_all'):
-                all_names = [p['name'] for p in S.districts_all]
-                sel = st.multiselect('Районы на карте', all_names, default=all_names, key='d_sel',
-                                     help='По умолчанию — все районы субъекта; лишние можно убрать из списка.')
-                S.districts = [p for p in S.districts_all if p['name'] in set(sel)]
-                if st.button('Очистить загруженные районы'):
-                    S.districts_all, S.districts = None, None
-            show_d = st.checkbox('Показывать границы районов', value=bool(S.districts))
-        water = None
-        if need_osm:
-            wsrc = st.radio('Реки и озёра', ['Крупные (встроенные, Natural Earth)', 'Подробные (OpenStreetMap)',
-                                             'Не показывать'], horizontal=True)
-            if wsrc.startswith('Крупные'):
-                water = dict(rivers=basemap.ne_layer('rivers', bbox), lakes=basemap.ne_layer('lakes', bbox))
-            elif wsrc.startswith('Подробные'):
-                if osm_rel is None:
-                    st.caption('Выберите субъект в разделе «Субъект и административные районы» выше; без него '
-                               'реки запрашиваются по прямоугольному охвату карты.')
-                if st.button('Загрузить реки и озёра (Overpass API)'):
-                    try:
-                        with st.spinner('Запрос к Overpass API (до 3 минут при первой загрузке)…'):
-                            S.water = basemap.fetch_osm_water(bbox=bbox, rel_id=osm_rel)
-                        st.success(f'Рек: {len(S.water["rivers"])}, водоёмов: {len(S.water["lakes"])}.')
-                    except basemap.ServiceError as e:
-                        st.error(str(e))
-                    except Exception as e:
-                        st.error(f'Реки и озёра не загружены: {e}')
-                water = S.water or dict(rivers=basemap.ne_layer('rivers', bbox), lakes=basemap.ne_layer('lakes', bbox))
-        districts = None
-        if show_d and S.districts:
-            districts = S.districts
-        dem = None
-        show_cities = True
-        if kind == 'Физическая':
-            with st.expander('Рельеф', expanded=True):
-                rsrc = st.radio('Источник рельефа', ['Тайлы высот Terrarium (AWS, SRTM)', 'Свой файл ЦМР (.tif, .asc)',
-                                                     'Без рельефа'], horizontal=True)
-                if rsrc.startswith('Тайлы'):
-                    zoom = st.select_slider('Детальность (уровень тайлов)', [6, 7, 8, 9], value=8)
-                    if st.button('Загрузить рельеф'):
-                        try:
-                            bar = st.progress(0.0, text='Загрузка тайлов высот…')
-                            S.dem = basemap.fetch_dem(bbox, zoom=zoom, progress=lambda f: bar.progress(f))
-                            bar.empty()
-                        except basemap.ServiceError as e:
-                            st.error(str(e))
-                        except Exception as e:
-                            st.error(f'Не удалось загрузить рельеф: {e}')
-                elif rsrc.startswith('Свой'):
-                    df_ = st.file_uploader('ЦМР в географических координатах', type=['tif', 'tiff', 'asc'])
-                    if df_ is not None:
-                        try:
-                            S.dem = basemap.load_dem_file(df_.getvalue(), df_.name)
-                        except Exception as e:
-                            st.error(f'Ошибка чтения ЦМР: {e}')
-                if not rsrc.startswith('Без') and S.dem is not None:
-                    dem = S.dem
-            show_cities = st.checkbox('Города', value=True)
-        polys_assigned = None
-        if districts and (cluster_col or value_col):
-            if cluster_col:
-                polys_assigned = mapping.assign_clusters_to_polygons(
-                    districts, sdf.rename(columns={'lat': 'Lat', 'lon': 'Lon', 'name': 'Название'}), cluster_col='Кластер')
-            elif field is not None:
-                vals = interp.zonal_mean(field, grid[1], grid[0], districts)
-                polys_assigned = [{**p, 'value': v} for p, v in zip(districts, vals)]
-        try:
-            if sdf.empty:
-                st.info('Нет станций с координатами в выбранном регионе.')
-            elif kind == 'Схематическая':
-                mode = st.radio('Способ', ['thiessen', 'field', 'points'], horizontal=True,
-                                format_func={'thiessen': 'Полигоны Тиссена', 'field': 'Изолинии (интерполяция)',
-                                             'points': 'Только точки'}.get,
-                                index=1 if value_col else 0,
-                                help='Полигоны Тиссена — каждой точке территории присваивается значение ближайшей станции.')
-                if rgeom is None and mode == 'thiessen':
-                    st.info('Для полигонов Тиссена выберите границу субъекта.')
+                    st.error(f'Ошибка загрузки: {e}')
+                    continue
+
+                if isinstance(loaded, dict):
+                    sheet = st.selectbox('Лист Excel', list(loaded.keys()),
+                                          key=f'sheet_{f.name}')
+                    df_raw = loaded[sheet]
                 else:
-                    fig = maps.map_schematic(sdf, rgeom, bbox, cluster_col=cluster_col, value_col=value_col,
-                                             value_label=vlabel, title=title, mode=mode, field=field, grid=grid,
-                                             decimals=dec, labels=labels_on, rivers=water, districts=districts)
-                    show_fig(fig, f'map_схематическая_{rg}', kind_='map')
-            elif kind == 'По административным районам':
-                if not polys_assigned:
-                    st.info('Загрузите границы районов и выберите районы-кластеры или показатель.')
-                else:
-                    show_lab = st.checkbox('Подписывать районы', value=False)
-                    fig = maps.map_districts(polys_assigned, sdf, bbox, key='cluster' if cluster_col else 'value',
-                                             value_label=vlabel, title=title, decimals=dec, show_labels=show_lab,
-                                             region_geom=rgeom, rivers=water, station_labels=labels_on)
-                    show_fig(fig, f'map_районы_{rg}', kind_='map')
-                    tbl = pd.DataFrame([{'Административный район': p['name'],
-                                         ('Район-кластер' if cluster_col else 'Значение'):
-                                             p.get('cluster' if cluster_col else 'value'),
-                                         'Станций внутри': p.get('n_stations_inside', '')} for p in polys_assigned])
-                    show_df(tbl, 2)
-                    save_table(f'table_19_районы_карта_{rg}', tbl, 2)
-                    footnote('Для кластеров: район окрашен по преобладающему кластеру станций внутри него, без станций — '
-                             'по ближайшей станции. Для показателя: среднее значение интерполированного поля в границах '
-                             'района.')
-            elif kind == 'Физическая':
-                clusters_poly = None
-                if cluster_col:
-                    if polys_assigned:
-                        clusters_poly = polys_assigned
-                    elif rgeom is not None:
-                        cells = maps.thiessen(sdf, rgeom)
-                        clusters_poly = [{'geometry': c, 'cluster': k} for c, k in zip(cells, sdf['Кластер'])
-                                         if c is not None]
-                fig = maps.map_physical(bbox, rgeom, dem=dem[0] if dem else None, dem_extent=dem[1] if dem else None,
-                                        water=water, cities=basemap.ne_layer('cities', bbox) if show_cities else None,
-                                        st=sdf, st_labels=labels_on, field=field if value_col else None, grid=grid,
-                                        value_label=vlabel, decimals=dec, districts=districts, title=title,
-                                        clusters=clusters_poly)
-                show_fig(fig, f'map_физическая_{rg}', kind_='map')
-                if dem is None:
-                    footnote('Рельеф не загружен: нажмите «Загрузить рельеф» (нужен интернет) или загрузите файл ЦМР.')
-            elif kind == 'На растровой подложке':
-                prov = st.selectbox('Подложка', list(basemap.TILE_PROVIDERS))
-                zoom = st.select_slider('Детальность', [5, 6, 7, 8, 9], value=7)
-                alpha = st.slider('Непрозрачность заливки', 0.0, 1.0, 0.45)
-                if st.button('Построить'):
-                    try:
-                        bar = st.progress(0.0, text='Загрузка тайлов…')
-                        img, ext = basemap.fetch_mosaic(bbox, basemap.TILE_PROVIDERS[prov], zoom,
-                                                        progress=lambda f: bar.progress(f))
-                        bar.empty()
-                        polys = polys_assigned
-                        if polys is None and cluster_col and rgeom is not None:
-                            cells = maps.thiessen(sdf, rgeom)
-                            polys = [{'geometry': c, 'cluster': k, 'name': ''} for c, k in zip(cells, sdf['Кластер'])
-                                     if c is not None]
-                        fig = maps.map_tiles(bbox, img, ext, basemap.TILE_ATTRIB[prov], rgeom, polys,
-                                             key='cluster' if cluster_col else 'value', alpha=alpha, st=sdf,
-                                             st_labels=labels_on, title=title, value_label=vlabel, decimals=dec)
-                        show_fig(fig, f'map_подложка_{rg}', kind_='map')
-                    except basemap.ServiceError as e:
-                        st.error(str(e))
-                    except Exception as e:
-                        st.error(f'Не удалось загрузить подложку: {e}')
+                    df_raw = loaded
+                    sheet = None
+
+                st.caption(f'{df_raw.shape[0]} строк × {df_raw.shape[1]} столбцов')
+                st.dataframe(df_raw.head(8), use_container_width=True)
+
+                name_for_guess = sheet if sheet else f.name.rsplit('.', 1)[0]
+                guessed_role = data_io.guess_role(name_for_guess, df_raw)
+                role_options = ['— выбрать —', 'Климатический показатель (температура, осадки и т.п.)',
+                                 'Справочник станций (координаты, регион)', 'Пропустить']
+                role_default_idx = {'climate': 1, 'station_ref': 2}.get(guessed_role, 0)
+                if guessed_role:
+                    st.caption(f'🔍 Похоже на: {"климатический показатель" if guessed_role == "climate" else "справочник станций"} '
+                               f'(можно поменять ниже, если ошибся)')
+
+                role = st.selectbox('Роль этого файла/листа', role_options,
+                                     index=role_default_idx, key=f'role_{f.name}_{sheet}')
+
+                if role == 'Климатический показатель (температура, осадки и т.п.)':
+                    fmt = data_io.detect_format(df_raw)
+                    if fmt != 'wide_months':
+                        st.warning('Не похоже на широкий формат "Станция/Год + месяцы". '
+                                   'Столбцы-месяцы распознаются гибко (любой регистр, '
+                                   'сокращения, римские цифры, номера, декады), но их должно '
+                                   'быть не меньше 6.')
+                    guessed_label = data_io.guess_indicator_label(name_for_guess, df_raw)
+                    default_label = guessed_label or name_for_guess
+                    tip_label = st.text_input('Название показателя (например "Температура", '
+                                               '"Осадки")', value=default_label,
+                                               key=f'label_{f.name}_{sheet}')
+
+                    _, matched_month_cols = data_io.scan_month_columns(df_raw)
+                    id_candidates = [c for c in df_raw.columns if c not in matched_month_cols]
+                    default_ids = data_io.guess_id_columns(id_candidates)
+                    id_vars = st.multiselect('Столбцы-идентификаторы (Станция, Год)',
+                                              id_candidates, default=default_ids,
+                                              key=f'idvars_{f.name}_{sheet}')
+
+                    extra_candidates = [c for c in id_candidates if c not in id_vars]
+                    extra_cols = []
+                    if extra_candidates:
+                        with st.expander(f'📦 Дополнительные предрассчитанные показатели '
+                                         f'({len(extra_candidates)} столбцов — периодные суммы '
+                                         f'и т.п., не месяцы)', expanded=False):
+                            st.caption('Эти столбцы не похожи на отдельные месяцы (например '
+                                       'готовые суммы за произвольные периоды вида "X - III"). '
+                                       'Можно сохранить их как есть — они станут доступны как '
+                                       'дополнительные признаки для корреляции/кластеризации, '
+                                       'без попытки интерпретировать их как месячные значения.')
+                            extra_cols = st.multiselect('Сохранить эти столбцы как '
+                                                         'дополнительные показатели',
+                                                         extra_candidates,
+                                                         default=extra_candidates,
+                                                         key=f'extracols_{f.name}_{sheet}')
+
+                    decade_agg = 'mean'
+                    if data_io.has_decade_columns(df_raw):
+                        st.caption('🔍 Обнаружены декадные столбцы (например "1 декада '
+                                   'апреля") — они будут объединены в месячное значение.')
+                        default_agg_label = ('Сумма' if data_io.default_agg_for_type(default_label) == 'sum'
+                                              else 'Среднее')
+                        agg_choice = st.radio('Как объединять декады в месяц',
+                                               ['Среднее', 'Сумма'],
+                                               index=0 if default_agg_label == 'Среднее' else 1,
+                                               horizontal=True, key=f'decade_agg_{f.name}_{sheet}')
+                        decade_agg = 'sum' if agg_choice == 'Сумма' else 'mean'
+
+                    if st.button(f'➕ Добавить как показатель «{tip_label}»',
+                                 key=f'add_{f.name}_{sheet}'):
+                        try:
+                            long_typed = data_io.wide_months_to_long_typed(
+                                df_raw, id_vars, tip_label, decade_agg=decade_agg)
+                            st.session_state.typed_datasets[tip_label] = long_typed
+                            msg = f'Показатель «{tip_label}» добавлен ({len(long_typed)} строк).'
+                            if extra_cols:
+                                extra_table = data_io.build_extra_features_table(
+                                    df_raw, id_vars, extra_cols)
+                                st.session_state.extra_features[tip_label] = extra_table
+                                msg += f' Плюс {len(extra_cols)} доп. показателей сохранено отдельно.'
+                            st.success(msg)
+                        except Exception as e:
+                            st.error(f'Ошибка преобразования: {e}')
+
+                elif role == 'Справочник станций (координаты, регион)':
+                    cols = df_raw.columns.tolist()
+                    guessed_map = data_io.guess_station_column_map(df_raw)
+
+                    def _idx(options, guessed):
+                        return options.index(guessed) if guessed in options else 0
+
+                    c1, c2, c3, c4, c5 = st.columns(5)
+                    with c1:
+                        col_station = st.selectbox('Код станции', cols,
+                                                    index=_idx(cols, guessed_map.get('Станция')),
+                                                    key=f'ref_st_{f.name}')
+                    with c2:
+                        opts_name = ['—'] + cols
+                        col_name = st.selectbox('Название (опц.)', opts_name,
+                                                 index=_idx(opts_name, guessed_map.get('Название')),
+                                                 key=f'ref_name_{f.name}')
+                    with c3:
+                        opts_region = ['—'] + cols
+                        col_region = st.selectbox('Регион (опц.)', opts_region,
+                                                   index=_idx(opts_region, guessed_map.get('Регион')),
+                                                   key=f'ref_region_{f.name}')
+                    with c4:
+                        opts_lat = ['—'] + cols
+                        col_lat = st.selectbox('Широта (опц.)', opts_lat,
+                                                index=_idx(opts_lat, guessed_map.get('Lat')),
+                                                key=f'ref_lat_{f.name}')
+                    with c5:
+                        opts_lon = ['—'] + cols
+                        col_lon = st.selectbox('Долгота (опц.)', opts_lon,
+                                                index=_idx(opts_lon, guessed_map.get('Lon')),
+                                                key=f'ref_lon_{f.name}')
+                    if st.button('➕ Использовать как справочник станций',
+                                 key=f'add_ref_{f.name}'):
+                        st.session_state.stations_ref = df_raw
+                        st.session_state.stations_ref_map = {
+                            'Станция': col_station,
+                            'Название': None if col_name == '—' else col_name,
+                            'Регион': None if col_region == '—' else col_region,
+                            'Lat': None if col_lat == '—' else col_lat,
+                            'Lon': None if col_lon == '—' else col_lon,
+                        }
+                        st.success('Справочник станций сохранён.')
+
+        st.divider()
+        st.subheader('Текущее состояние')
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown('**Загруженные климатические показатели:**')
+            if st.session_state.typed_datasets:
+                for tip, d in st.session_state.typed_datasets.items():
+                    st.write(f'• {tip}: {len(d)} строк, '
+                             f'{d["Станция"].nunique()} станций, '
+                             f'{d["Год"].min()}–{d["Год"].max()} гг.')
             else:
-                import streamlit.components.v1 as components
-                cap = f'<b>{title}</b><br>'
-                if value_col:
-                    cap += (f'Цвет станций и заливка — {vlabel}' + (', поле интерполировано между станциями' if field is
-                                                                    not None else '') + '. Наведите на станцию для значения.')
-                elif cluster_col:
-                    cap += 'Цвет станций и районов — номер климатического района.'
-                else:
-                    cap += 'Метеостанции и граница субъекта. Выберите «Показатель» или «Районы-кластеры», чтобы раскрасить карту.'
-                m = maps.folium_map(sdf, polys_assigned, key='cluster' if cluster_col else 'value', region_geom=rgeom,
-                                    value_col=value_col, value_label=vlabel, cluster_col=cluster_col,
-                                    field=field, grid=grid, decimals=dec, caption=cap)
-                html = m.get_root().render()
-                # карта встраивается как готовая веб-страница: перемещение, масштаб и смена подложки
-                # выполняются в браузере и не запускают пересчёт программы
-                h_px = int(560 * MAP_W / 60)
-                if hasattr(st, 'iframe'):
-                    st.iframe(html, height=h_px)
-                else:
-                    components.html(html, height=h_px, scrolling=False)
-                st.download_button('Скачать интерактивную карту (HTML)', html.encode('utf-8'),
-                                   file_name=f'map_интерактивная_{rg}.html', mime='text/html', key='dl_folium')
-                footnote('Слои (подложки, поле, районы, станции) включаются и отключаются в правом верхнем углу карты. '
-                         'Скачанный файл HTML открывается в любом браузере и работает без программы (для подложек '
-                         'нужен интернет).')
-        except Exception as e:
-            st.exception(e)
+                st.write('— пока ничего не добавлено')
+        with c2:
+            st.markdown('**Справочник станций:**')
+            if st.session_state.stations_ref is not None:
+                st.write(f'✅ загружен, {len(st.session_state.stations_ref)} записей')
+            else:
+                st.write('— не загружен (карта и региональный анализ будут недоступны)')
 
+        st.divider()
+        if st.session_state.typed_datasets:
+            if st.button('🔗 Собрать общий набор данных', type='primary'):
+                with st.status('⏳ Идёт расчёт: объединение данных...', expanded=True) as status:
+                    combined = data_io.combine_typed_datasets(
+                        list(st.session_state.typed_datasets.values()))
+                    if st.session_state.stations_ref is not None:
+                        try:
+                            combined = data_io.merge_station_reference(
+                                combined, st.session_state.stations_ref,
+                                st.session_state.stations_ref_map)
+                        except Exception as e:
+                            st.warning(f'Не удалось присоединить справочник станций: {e}')
+                    status.update(label='✅ Данные объединены', state='complete')
+                st.session_state.long_combined = combined
+                y_min, y_max = int(combined['Год'].min()), int(combined['Год'].max())
+                st.session_state.subsamples['Весь период'] = (y_min, y_max)
+                st.success(f'Общий набор данных собран: {len(combined)} строк.')
 
-with tabs[7]:
-    maps_tab()
-
-# ═══════════════════════════ 9. ЭКСПОРТ ══════════════════════════════════
-with tabs[8]:
-    st.header('Экспорт результатов')
-    if not S.raw:
-        st.info('Нет данных.')
+        if st.session_state.long_combined is not None:
+            st.subheader('Предпросмотр общего набора данных')
+            st.dataframe(st.session_state.long_combined.head(20), use_container_width=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button('Сохранить (.xlsx)',
+                                    data_io.df_to_excel_bytes(st.session_state.long_combined),
+                                    file_name='combined_long.xlsx')
+            with c2:
+                st.download_button('Сохранить (.csv)',
+                                    data_io.df_to_csv_bytes(st.session_state.long_combined),
+                                    file_name='combined_long.csv')
     else:
-        st.subheader('Передача в программу климатического районирования')
-        st.markdown(f'Программа климатического районирования территорий: [{ZONING_URL}]({ZONING_URL}). Файл ниже '
-                    'содержит помесячные ряды температуры (по Tсредней) и осадков (суточные суммы) по прошедшим '
-                    'контролю данным и лист «Справочник станций» — в формате, который её вкладка «Данные» распознаёт '
-                    'автоматически. Месяц учитывается при наличии не менее 25 суток с данными.')
-        src = current_data()
-        st.download_button('Скачать помесячные ряды для районирования (.xlsx)', export.zoning_xlsx(src, S.stations),
-                           file_name='помесячные_ряды_для_районирования.xlsx')
-        st.subheader('Суточные ряды')
-        which = st.radio('Набор', ['Восстановленные', 'Очищенные', 'Исходные'], horizontal=True)
-        dd = {'Восстановленные': S.filled, 'Очищенные': S.clean, 'Исходные': S.raw['data']}[which]
-        if dd is not None and st.button('Сформировать файл суточных рядов'):
-            sheets = export.daily_export(dd, S.flags if which != 'Исходные' else None,
-                                         S.fill_log if which == 'Восстановленные' else None)
-            st.download_button('Скачать суточные ряды (.xlsx)', export.xlsx_bytes(sheets, 1),
-                               file_name=f'суточные_ряды_{which.lower()}.xlsx')
-            footnote('Признаки качества: R — ошибочное значение исключено, C — исправленное, S — требует проверки; '
-                     'в столбцах «…_восстановлено» — метод восстановления.')
-        st.subheader('Все таблицы и рисунки')
-        st.caption(f'Сохранено таблиц: {len(S.tables)}, рисунков: {len(S.figs)} (то, что открывалось на вкладках).')
-        if st.button('Собрать архив'):
-            files = {}
-            for n, (df, d) in S.tables.items():
-                files[f'tables/{n}.xlsx'] = export.xlsx_bytes({'Таблица': df}, d)
-            for n, f in S.figs.items():
-                files[f'figures/{n}.png'] = export.fig_bytes(f, 'png')
-                files[f'figures/{n}.pdf'] = export.fig_bytes(f, 'pdf')
-            if S.qc_log is not None:
-                files['журнал_контроля_качества.xlsx'] = export.xlsx_bytes({'Журнал': S.qc_log}, 2)
-            st.download_button('Скачать архив (.zip)', export.zip_bundle(files), file_name='результаты.zip')
-        st.subheader('Параметры обработки')
-        prm = {k: getattr(P, k) for k in dir(P) if k.isupper()}
-        st.download_button('Скачать параметры (.json)', json.dumps(prm, ensure_ascii=False, indent=1, default=str),
-                           file_name='параметры_обработки.json')
+        st.info('Загрузите хотя бы один файл, чтобы начать.')
+
+
+# =============================================================================
+# ВКЛАДКА 2: ПОДВЫБОРКИ И ПЕРИОДЫ
+# =============================================================================
+with tab_sub:
+    st.header('Проверка однородности ряда и формирование подвыборок')
+    st.markdown(
+        'Тест Петтитта ищет год наиболее вероятного изменения климатического '
+        'режима, ITA (Şen, 2012) проверяет наличие значимого тренда. На основе '
+        'этих тестов формируется рекомендация — стоит ли делить весь период '
+        'на подвыборки (например «ранний» и «современный»), и предлагается '
+        'год разбиения.'
+    )
+
+    ld = st.session_state.long_combined
+    if ld is None or ld.empty:
+        st.info('Сначала соберите общий набор данных во вкладке "Данные".')
+    else:
+        tips = data_io.unique_values(ld, 'Тип')
+        c1, c2 = st.columns(2)
+        with c1:
+            test_tip = st.selectbox('Показатель для проверки', tips, key='test_tip')
+        with c2:
+            level_opt = ['Все станции (среднее)']
+            if 'Регион' in ld.columns and ld['Регион'].notna().any():
+                level_opt.append('Конкретный регион')
+            level_opt.append('Конкретная станция')
+            test_level = st.selectbox('Уровень', level_opt, key='test_level')
+
+        test_station, test_region = None, None
+        if test_level == 'Конкретная станция':
+            names = data_io.unique_values(ld, 'Название') or data_io.unique_values(ld, 'Станция')
+            lbl = st.selectbox('Станция', names, key='test_station_lbl')
+            test_station = (ld.loc[ld['Название'] == lbl, 'Станция'].iloc[0]
+                             if 'Название' in ld.columns else lbl)
+        elif test_level == 'Конкретный регион':
+            test_region = st.selectbox('Регион', data_io.unique_values(ld, 'Регион'),
+                                        key='test_region_sel')
+
+        agg = data_io.default_agg_for_type(test_tip)
+        ys = data_io.yearly_series(ld, test_tip, station=test_station, region=test_region, agg=agg)
+
+        if len(ys.dropna()) < 8:
+            st.warning('Недостаточно точек ряда для тестов (нужно минимум 8 лет).')
+        else:
+            rec = tests_stat.recommend_periods(ys)
+            st.markdown(rec['text'])
+
+            figsize, color, _ = size_and_color_controls('pettitt', default_size='Широкий (12×8)')
+            show_caption('pettitt')
+            fig = viz.pettitt_chart(ys, rec['pettitt'],
+                                     title=f'{test_tip}: {test_level}'
+                                           + (f' ({test_station or test_region})'
+                                              if (test_station or test_region) else ''),
+                                     figsize=figsize, color=color)
+            show_plot(fig)
+            download_row(fig, f'graph_pettitt_{test_tip}', 'pettitt')
+
+            st.divider()
+            st.subheader('Создать именованную подвыборку')
+            y_min_all, y_max_all = int(ld['Год'].min()), int(ld['Год'].max())
+            with st.form('add_subsample_form'):
+                c1, c2, c3 = st.columns(3)
+                with c1:
+                    sub_name = st.text_input('Название подвыборки',
+                                              placeholder='например "Современный период"')
+                with c2:
+                    sub_y1 = st.number_input('Год с', min_value=y_min_all, max_value=y_max_all,
+                                              value=y_min_all)
+                with c3:
+                    sub_y2 = st.number_input('Год по', min_value=y_min_all, max_value=y_max_all,
+                                              value=y_max_all)
+                submitted = st.form_submit_button('➕ Добавить подвыборку')
+                if submitted:
+                    if not sub_name.strip():
+                        st.error('Укажите название подвыборки.')
+                    elif sub_y1 > sub_y2:
+                        st.error('"Год с" не может быть больше "Год по".')
+                    else:
+                        st.session_state.subsamples[sub_name.strip()] = (int(sub_y1), int(sub_y2))
+                        st.success(f'Подвыборка «{sub_name}» ({sub_y1}–{sub_y2}) добавлена.')
+
+            if rec['pettitt']['change_year'] is not None:
+                cy = rec['pettitt']['change_year']
+                c1, c2 = st.columns(2)
+                with c1:
+                    if st.button(f'⚡ Быстро создать «Ранний период» ({y_min_all}–{cy})'):
+                        st.session_state.subsamples['Ранний период'] = (y_min_all, cy)
+                        st.success('Добавлено.')
+                with c2:
+                    if st.button(f'⚡ Быстро создать «Современный период» ({cy+1}–{y_max_all})'):
+                        st.session_state.subsamples['Современный период'] = (cy + 1, y_max_all)
+                        st.success('Добавлено.')
+
+        st.divider()
+        st.subheader('Текущие подвыборки')
+        if st.session_state.subsamples:
+            for name, (y1, y2) in list(st.session_state.subsamples.items()):
+                c1, c2 = st.columns([4, 1])
+                with c1:
+                    st.write(f'• **{name}**: {y1}–{y2} гг.')
+                with c2:
+                    if name != 'Весь период' and st.button('🗑️ Удалить', key=f'del_sub_{name}'):
+                        del st.session_state.subsamples[name]
+                        st.rerun()
+        else:
+            st.info('Подвыборок пока нет — соберите данные во вкладке "Данные", '
+                    '«Весь период» появится автоматически.')
+
+        st.caption('Выбор подвыборки (периода) доступен на вкладках "Описательная '
+                   'статистика", "Климатические индексы" и "Корреляция" — везде, где '
+                   'нужно ограничить анализ конкретным диапазоном лет.')
+
+
+# =============================================================================
+# ВКЛАДКА 2: ОПИСАТЕЛЬНАЯ СТАТИСТИКА
+# =============================================================================
+with tab_desc:
+    st.header('Описательная статистика')
+
+    ld = st.session_state.long_combined
+    if ld is None or ld.empty:
+        st.info('Сначала соберите общий набор данных во вкладке "Данные".')
+    else:
+        ld, active_sub = subsample_selector(ld, 'sub_desc')
+        st.subheader('Контекст анализа')
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            tips = data_io.unique_values(ld, 'Тип')
+            tip = st.selectbox('Показатель', tips)
+        with c2:
+            level_options = ['Все станции']
+            if 'Регион' in ld.columns and ld['Регион'].notna().any():
+                level_options.append('Конкретный регион')
+            level_options.append('Конкретная станция')
+            level = st.selectbox('Уровень агрегации', level_options)
+        with c3:
+            period_mode = st.selectbox('Период', ['Весь период', 'Конкретный год',
+                                                    'Конкретный месяц (по всем годам)'])
+
+        station, region, year, month = None, None, None, None
+        if level == 'Конкретная станция':
+            station_names = data_io.unique_values(ld, 'Название') or data_io.unique_values(ld, 'Станция')
+            station_label = st.selectbox('Станция', station_names)
+            if 'Название' in ld.columns:
+                station = ld.loc[ld['Название'] == station_label, 'Станция'].iloc[0]
+            else:
+                station = station_label
+        elif level == 'Конкретный регион':
+            region = st.selectbox('Регион', data_io.unique_values(ld, 'Регион'))
+
+        if period_mode == 'Конкретный год':
+            year = st.selectbox('Год', data_io.unique_values(ld, 'Год'))
+        elif period_mode == 'Конкретный месяц (по всем годам)':
+            month = st.selectbox('Месяц', data_io.unique_values(ld, 'Месяц'))
+
+        filtered = data_io.filter_long(ld, tip=tip, station=station, region=region,
+                                        year=year, month=month)
+
+        context_desc = f'{active_sub} · {tip} · {level}'
+        if station:
+            context_desc += f' ({station})'
+        if region:
+            context_desc += f' ({region})'
+        context_desc += f' · {period_mode}'
+        if year:
+            context_desc += f' ({year})'
+        if month:
+            context_desc += f' ({month})'
+        st.info(f'**Текущий контекст:** {context_desc} — {len(filtered)} наблюдений')
+
+        if filtered.empty:
+            st.warning('Нет данных для выбранного сочетания фильтров.')
+        else:
+            st.subheader(f'Описательная статистика: {context_desc}')
+            desc_target = descriptive.descriptive_target(filtered['Значение'], tip)
+            st.dataframe(desc_target, use_container_width=True)
+            if not desc_target.empty:
+                st.markdown(f'**Вывод о нормальности:** '
+                            f'{descriptive.normality_conclusion(desc_target.iloc[0])}')
+            safe_name = context_desc.replace(' ', '_').replace('·', '-')
+            st.download_button('Сохранить таблицу (.xlsx)',
+                                data_io.df_to_excel_bytes(desc_target, 'Описательная стат.'),
+                                file_name=f'table_01_descriptive_{safe_name}.xlsx')
+
+            st.divider()
+            st.subheader('Графики')
+
+            chart_type = st.radio('Тип графика',
+                                   ['Гистограмма с KDE', 'Ящик с усами (по группам)',
+                                    'Динамика по годам', 'Совмещённая динамика 2 показателей'],
+                                   horizontal=True)
+
+            if chart_type == 'Гистограмма с KDE':
+                show_caption('hist_kde')
+                figsize, color, legend_loc = size_and_color_controls('hist')
+                fig = viz.hist_kde(filtered['Значение'], title=f'Распределение: {context_desc}',
+                                    xlabel=tip, figsize=figsize, color=color, legend_loc=legend_loc)
+                show_plot(fig)
+                download_row(fig, f'graph_hist_{safe_name}', 'hist')
+
+            elif chart_type == 'Ящик с усами (по группам)':
+                show_caption('boxplot')
+                group_by = st.selectbox('Группировать по', ['Станция', 'Год', 'Регион']
+                                         if 'Регион' in filtered.columns else ['Станция', 'Год'])
+                annotate_on_chart = st.checkbox('Показывать Мин/Макс подписи на самом графике',
+                                                 value=False,
+                                                 help='При многих группах подписи накладываются '
+                                                      'друг на друга — по умолчанию сводка '
+                                                      'выводится отдельной таблицей ниже.')
+                figsize, color, legend_loc = size_and_color_controls('box', with_color=False)
+                group_col = 'Название' if group_by == 'Станция' and 'Название' in filtered.columns else group_by
+                fig = viz.boxplot_groups(filtered, 'Значение', group_col,
+                                          title=f'{tip} по {group_by.lower()}ам', ylabel=tip,
+                                          figsize=figsize, legend_loc=legend_loc,
+                                          annotate_minmax=annotate_on_chart)
+                show_plot(fig)
+                download_row(fig, f'graph_box_{safe_name}', 'box')
+
+                st.markdown('**Мин/Макс/Среднее/Медиана по группам:**')
+                summary_df = viz.boxplot_minmax_summary(filtered, 'Значение', group_col)
+                st.dataframe(summary_df, use_container_width=True)
+
+            elif chart_type == 'Динамика по годам':
+                show_caption('timeseries')
+                agg_mode = st.radio('Агрегация месяцев в год', ['Среднее', 'Сумма'],
+                                     horizontal=True,
+                                     index=0 if data_io.default_agg_for_type(tip) == 'mean' else 1)
+                agg = 'mean' if agg_mode == 'Среднее' else 'sum'
+                show_trend = st.checkbox('Показать линию тренда', value=True)
+                show_smooth = st.checkbox('Показать скользящее среднее (11 лет)', value=False)
+                figsize, color, legend_loc = size_and_color_controls('ts')
+                ys = data_io.yearly_series(ld, tip, station=station, region=region, agg=agg)
+                fig = viz.time_series_line(ys, title=f'Динамика: {context_desc}',
+                                            ylabel=tip, figsize=figsize, color=color,
+                                            show_trend=show_trend, show_smooth=show_smooth,
+                                            legend_loc=legend_loc)
+                show_plot(fig)
+                download_row(fig, f'graph_dynamics_{safe_name}', 'ts')
+
+            elif chart_type == 'Совмещённая динамика 2 показателей':
+                show_caption('timeseries_combo')
+                if len(tips) < 2:
+                    st.warning('Нужно как минимум два показателя (например Температура и Осадки).')
+                else:
+                    other_tip = st.selectbox('Второй показатель', [t for t in tips if t != tip])
+                    agg1 = data_io.default_agg_for_type(tip)
+                    agg2 = data_io.default_agg_for_type(other_tip)
+                    figsize, _, legend_loc = size_and_color_controls('combo', with_color=False)
+                    ys1 = data_io.yearly_series(ld, tip, station=station, region=region, agg=agg1)
+                    ys2 = data_io.yearly_series(ld, other_tip, station=station, region=region, agg=agg2)
+                    fig = viz.time_series_combo(ys1, ys2, tip, other_tip,
+                                                 title=f'{tip} и {other_tip}: {level}'
+                                                       + (f' ({station or region})' if (station or region) else ''),
+                                                 figsize=figsize, legend_loc=legend_loc)
+                    show_plot(fig)
+                    download_row(fig, f'graph_combo_{safe_name}', 'combo')
+
+
+# =============================================================================
+# ВКЛАДКА 3: КЛИМАТИЧЕСКИЕ ИНДЕКСЫ
+# =============================================================================
+with tab_ind:
+    st.header('Расчёт климатических показателей')
+    st.markdown(
+        'На основе температуры и осадков рассчитываются производные '
+        'характеристики по каждой станции: сезонные средние/суммы, индекс '
+        'континентальности Конрада, индексы аридности и увлажнения, ГТК, '
+        'линейные тренды. Эта таблица — основа для проверки '
+        'мультиколлинеарности и дальнейшего отбора признаков.'
+    )
+
+    ld = st.session_state.long_combined
+    if ld is None or ld.empty:
+        st.info('Сначала соберите общий набор данных во вкладке "Данные".')
+    else:
+        ld, active_sub_ind = subsample_selector(ld, 'sub_ind')
+        st.caption(f'Активная подвыборка: **{active_sub_ind}**')
+        tips = data_io.unique_values(ld, 'Тип')
+        if len(tips) < 2:
+            st.warning('Нужны минимум два показателя (температура и осадки), '
+                       'чтобы рассчитать производные индексы.')
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                temp_tip = st.selectbox('Какой показатель — температура?', tips,
+                                         index=next((i for i, t in enumerate(tips)
+                                                      if 'температ' in t.lower()), 0))
+            with c2:
+                precip_candidates = [t for t in tips if t != temp_tip]
+                precip_tip = st.selectbox('Какой показатель — осадки?', precip_candidates,
+                                           index=next((i for i, t in enumerate(precip_candidates)
+                                                        if 'осад' in t.lower()), 0))
+
+            has_lat = 'Lat' in ld.columns and ld['Lat'].notna().any()
+            if not has_lat:
+                st.info('Справочник станций с широтой не загружен — индекс '
+                        'континентальности Конрада не будет рассчитан (нужна широта). '
+                        'Остальные показатели считаются без неё.')
+
+            if st.button('🧮 Рассчитать индексы', type='primary'):
+                lat_map = None
+                if has_lat:
+                    lat_map = (ld[['Станция', 'Lat']].drop_duplicates('Станция')
+                               .set_index('Станция')['Lat'].to_dict())
+                with st.status('⏳ Идёт расчёт: климатические показатели по станциям...',
+                                expanded=True) as status:
+                    ind_table = indicators.compute_indicators(ld, temp_tip, precip_tip, lat_map=lat_map)
+                    status.update(label='✅ Индексы рассчитаны', state='complete')
+                st.session_state.indicators_table = ind_table
+                st.success(f'Рассчитано для {len(ind_table)} станций.')
+
+            if st.session_state.indicators_table is not None:
+                ind_table = st.session_state.indicators_table
+
+                if st.session_state.extra_features:
+                    with st.expander('📦 Добавить дополнительные предрассчитанные показатели',
+                                     expanded=False):
+                        st.caption('Показатели, сохранённые "как есть" при загрузке данных '
+                                   '(периодные суммы и т.п.) — присоединяются к таблице '
+                                   'индексов по станции, усредняя по годам.')
+                        sources = st.multiselect('Источники', list(st.session_state.extra_features.keys()),
+                                                  key='extra_merge_sources')
+                        if sources and st.button('➕ Присоединить к таблице индексов'):
+                            merged = ind_table.copy()
+                            for src in sources:
+                                extra_df = st.session_state.extra_features[src]
+                                agg_extra = data_io.aggregate_extra_features_by_station(
+                                    extra_df, station_col='Станция',
+                                    exclude_cols=[c for c in extra_df.columns
+                                                  if c not in extra_df.select_dtypes(
+                                                      include=[np.number]).columns
+                                                  and c != 'Станция'] + ['Год', 'год'])
+                                merged = merged.merge(agg_extra, on='Станция', how='left',
+                                                       suffixes=('', f'_{src}'))
+                            st.session_state.indicators_table = merged
+                            st.success(f'Присоединено. Итоговая таблица: {merged.shape[1]-1} '
+                                       f'показателей на {len(merged)} станций.')
+                            st.rerun()
+
+                st.subheader('Таблица индексов по станциям')
+                st.dataframe(ind_table, use_container_width=True)
+                st.download_button('Сохранить таблицу (.xlsx)',
+                                    data_io.df_to_excel_bytes(ind_table, 'Индексы'),
+                                    file_name='table_indicators.xlsx')
+
+                with st.expander('📖 Справка: как считается каждый показатель'):
+                    for name, formula in indicators.INDICATOR_FORMULAS.items():
+                        st.markdown(f'**{name}** — {formula}')
+
+                st.divider()
+                st.subheader('Описательная статистика по индексам')
+                feat_cols = indicators.indicator_feature_columns(ind_table)
+                desc_all = descriptive.descriptive_all_features(ind_table, feat_cols)
+                st.dataframe(desc_all, use_container_width=True)
+                st.download_button('Сохранить (.xlsx)',
+                                    data_io.df_to_excel_bytes(desc_all, 'Стат. по индексам'),
+                                    file_name='table_02_descriptive_indicators.xlsx')
+
+
+# =============================================================================
+# ВКЛАДКА 4: КОРРЕЛЯЦИОННЫЙ АНАЛИЗ
+# =============================================================================
+with tab_corr:
+    st.header('Корреляционный анализ и мультиколлинеарность')
+
+    ld = st.session_state.long_combined
+    if ld is None or ld.empty:
+        st.info('Сначала соберите общий набор данных во вкладке "Данные".')
+    else:
+        ld, active_sub_corr = subsample_selector(ld, 'sub_corr')
+        st.caption(f'Активная подвыборка (для режимов «месяцы» и «сопоставление»): '
+                   f'**{active_sub_corr}**. Режим по индексам использует подвыборку, '
+                   f'выбранную при расчёте во вкладке 4.')
+        st.markdown(
+            'Здесь анализируется связь **между месяцами** одного показателя '
+            '(например, насколько похожи январь и февраль между собой — это '
+            'полезно для отбора неизбыточных признаков), связь между '
+            '**двумя показателями** (например температура и осадки), либо '
+            'мультиколлинеарность среди **рассчитанных климатических индексов** '
+            '(вкладка 3) — рекомендуется именно этот режим для финального '
+            'отбора признаков.'
+        )
+
+        mode_options = ['Мультиколлинеарность месяцев одного показателя',
+                         'Сопоставление двух показателей (T vs P и т.п.)']
+        if st.session_state.indicators_table is not None:
+            mode_options.insert(0, 'Мультиколлинеарность климатических индексов (рекоменд.)')
+        mode = st.radio('Режим анализа', mode_options, horizontal=False)
+
+        if mode == 'Мультиколлинеарность климатических индексов (рекоменд.)':
+            ind_table = st.session_state.indicators_table
+            feat_cols = indicators.indicator_feature_columns(ind_table)
+            st.subheader('Матрица корреляций между индексами')
+            figsize, _, _ = size_and_color_controls('heat_ind', with_color=False,
+                                                      default_size='Матрица (10×8)')
+            corr_df, pval_df = correlation.correlation_matrix(ind_table, feat_cols, method='pearson')
+            show_caption('heatmap')
+            fig = viz.correlation_heatmap(corr_df, title='Корреляция климатических индексов',
+                                           figsize=figsize)
+            show_plot(fig)
+            download_row(fig, 'graph_heatmap_indicators', 'heat_ind')
+
+            st.divider()
+            st.subheader('Автоматическая проверка мультиколлинеарности')
+            threshold = st.slider('Порог |r| для признания признаков избыточными',
+                                   0.5, 0.99, 0.8, 0.01, key='thr_ind')
+            pairs_df, keep_list, drop_list = correlation.auto_flag_multicollinearity(
+                ind_table, feat_cols, threshold=threshold)
+            if pairs_df.empty:
+                st.success('Пар с корреляцией выше порога не найдено.')
+                keep_list = feat_cols
+            else:
+                st.dataframe(pairs_df, use_container_width=True)
+                st.markdown(f'**Рекомендуется оставить:** {", ".join(keep_list)}')
+                st.markdown(f'**Рекомендуется исключить (избыточны):** '
+                            f'{", ".join(drop_list) if drop_list else "—"}')
+                st.download_button('Сохранить список пар (.xlsx)',
+                                    data_io.df_to_excel_bytes(pairs_df, 'Мультиколлинеарность'),
+                                    file_name='table_multicollinearity_indicators.xlsx')
+
+            st.divider()
+            st.subheader('💾 Сохранить набор признаков')
+            st.caption('Отредактируйте список при необходимости и сохраните под именем — '
+                       'этот набор станет доступен во вкладке "Важность признаков" и при '
+                       'дальнейшем отборе/кластеризации.')
+            chosen_features = st.multiselect('Признаки в наборе', feat_cols,
+                                              default=keep_list, key='fs_multiselect')
+            fs_name = st.text_input('Название набора', value='без мультиколлинеарности',
+                                     key='fs_name_input')
+            if st.button('💾 Сохранить набор признаков', type='primary'):
+                if not fs_name.strip():
+                    st.error('Укажите название набора.')
+                elif not chosen_features:
+                    st.error('Выберите хотя бы один признак.')
+                else:
+                    st.session_state.feature_sets[fs_name.strip()] = chosen_features
+                    st.success(f'Набор «{fs_name}» сохранён ({len(chosen_features)} признаков).')
+
+            if st.session_state.feature_sets:
+                st.markdown('**Сохранённые наборы признаков:**')
+                for name, feats in list(st.session_state.feature_sets.items()):
+                    c1, c2 = st.columns([4, 1])
+                    with c1:
+                        st.write(f'• **{name}**: {", ".join(feats)}')
+                    with c2:
+                        if st.button('🗑️', key=f'del_fs_{name}'):
+                            del st.session_state.feature_sets[name]
+                            st.rerun()
+
+        elif mode == 'Мультиколлинеарность месяцев одного показателя':
+            tip = st.selectbox('Показатель', data_io.unique_values(ld, 'Тип'), key='corr_tip')
+            d = data_io.filter_long(ld, tip=tip)
+            wide = data_io.long_to_wide(d, ['Станция', 'Год'], 'Месяц', 'Значение')
+            month_cols = [m for m in data_io.MONTHS_RU if m in wide.columns]
+
+            if len(month_cols) < 2:
+                st.warning('Недостаточно месяцев для анализа.')
+            else:
+                st.subheader('Матрица корреляций между месяцами')
+                figsize, _, _ = size_and_color_controls('heat', with_color=False,
+                                                          default_size='Матрица (10×8)')
+                corr_df, pval_df = correlation.correlation_matrix(wide, month_cols, method='pearson')
+                show_caption('heatmap')
+                fig = viz.correlation_heatmap(corr_df, title=f'{tip}: корреляция месяцев',
+                                               figsize=figsize)
+                show_plot(fig)
+                download_row(fig, f'graph_heatmap_{tip}', 'heat')
+
+                st.divider()
+                st.subheader('Автоматическая проверка мультиколлинеарности')
+                threshold = st.slider('Порог |r| для признания признаков избыточными',
+                                       0.5, 0.99, 0.8, 0.01)
+                pairs_df, keep_list, drop_list = correlation.auto_flag_multicollinearity(
+                    wide, month_cols, threshold=threshold)
+                if pairs_df.empty:
+                    st.success('Пар с корреляцией выше порога не найдено — '
+                               'мультиколлинеарность не выявлена.')
+                else:
+                    st.dataframe(pairs_df, use_container_width=True)
+                    st.markdown(f'**Рекомендуется оставить:** {", ".join(keep_list)}')
+                    st.markdown(f'**Рекомендуется исключить (избыточны):** '
+                                f'{", ".join(drop_list) if drop_list else "—"}')
+                    st.download_button('Сохранить список пар (.xlsx)',
+                                        data_io.df_to_excel_bytes(pairs_df, 'Мультиколлинеарность'),
+                                        file_name=f'table_multicollinearity_{tip}.xlsx')
+
+        else:
+            tip1 = st.selectbox('Показатель 1', data_io.unique_values(ld, 'Тип'), key='corr_t1')
+            remaining = [t for t in data_io.unique_values(ld, 'Тип') if t != tip1]
+            if not remaining:
+                st.warning('Нужно как минимум два разных показателя (например Температура и Осадки).')
+            else:
+                tip2 = st.selectbox('Показатель 2', remaining, key='corr_t2')
+                agg1 = data_io.default_agg_for_type(tip1)
+                agg2 = data_io.default_agg_for_type(tip2)
+                st.caption(f'Агрегация в годовое значение: {tip1} → '
+                           f'{"среднее" if agg1=="mean" else "сумма"}, '
+                           f'{tip2} → {"среднее" if agg2=="mean" else "сумма"}')
+
+                d1 = data_io.filter_long(ld, tip=tip1)
+                d2 = data_io.filter_long(ld, tip=tip2)
+                y1 = d1.groupby(['Станция', 'Год'])['Значение'].agg(agg1).reset_index()
+                y2 = d2.groupby(['Станция', 'Год'])['Значение'].agg(agg2).reset_index()
+                merged = y1.merge(y2, on=['Станция', 'Год'], suffixes=(f'_{tip1}', f'_{tip2}'))
+                col1, col2 = f'Значение_{tip1}', f'Значение_{tip2}'
+                merged = merged.rename(columns={f'Значение_{tip1}': col1, f'Значение_{tip2}': col2})
+
+                if merged.empty:
+                    st.warning('Нет совпадающих станций/лет между показателями.')
+                else:
+                    st.subheader('Диаграмма рассеяния')
+                    show_caption('scatter')
+                    figsize, color, legend_loc = size_and_color_controls('scatter2')
+                    fig = viz.scatter_with_trend(
+                        merged, col1, col2,
+                        title=f'{tip1} vs {tip2} (по станциям и годам)',
+                        xlabel=tip1, ylabel=tip2, figsize=figsize, color=color,
+                        legend_loc=legend_loc)
+                    show_plot(fig)
+                    download_row(fig, f'graph_scatter_{tip1}_{tip2}', 'scatter2')
+
+                    st.divider()
+                    st.subheader('Ранжированная корреляция')
+                    st.caption('Здесь считается прямая связь между годовыми значениями '
+                               'двух показателей по всем станциям — не «целевая переменная», '
+                               'а просто сопоставление рядов.')
+                    r_p, p_p = correlation.stats.pearsonr(merged[col1], merged[col2])
+                    r_s, p_s = correlation.stats.spearmanr(merged[col1], merged[col2])
+                    st.write(f'Пирсон: r = {r_p:.3f}, p = {p_p:.4g} '
+                             f'{correlation.sig_stars(p_p)}')
+                    st.write(f'Спирмен: ρ = {r_s:.3f}, p = {p_s:.4g} '
+                             f'{correlation.sig_stars(p_s)}')
+
+
+
+# =============================================================================
+# ВКЛАДКА 6: РАЙОНИРОВАНИЕ (КЛАСТЕРНЫЙ АНАЛИЗ)
+# =============================================================================
+with tab_cluster:
+    st.header('Районирование: кластерный анализ')
+    st.markdown(
+        'K-means по стандартизированным климатическим индексам с подбором '
+        'оптимального числа кластеров по силуэтному коэффициенту. Результат — '
+        'разбиение станций на однородные климатические районы, PCA-биплот для '
+        'визуализации структуры и дендрограмма для верификации.'
+    )
+
+    ind_table = st.session_state.indicators_table
+    if ind_table is None or ind_table.empty:
+        st.info('Сначала рассчитайте климатические индексы во вкладке '
+                '"Климатические индексы" — кластеризация проводится по ним.')
+    else:
+        all_feat_cols = indicators.indicator_feature_columns(ind_table)
+
+        st.subheader('Выбор признаков для кластеризации')
+        fs_options = ['Все индексы'] + list(st.session_state.feature_sets.keys())
+        fs_choice = st.selectbox('Набор признаков', fs_options, key='cluster_fs')
+        if fs_choice == 'Все индексы':
+            default_features = all_feat_cols
+        else:
+            default_features = [c for c in st.session_state.feature_sets[fs_choice]
+                                 if c in all_feat_cols]
+        chosen_features = st.multiselect('Признаки', all_feat_cols,
+                                          default=default_features, key='cluster_features')
+
+        nan_cols = [c for c in chosen_features if ind_table[c].isna().all()]
+        if nan_cols:
+            st.warning(f'Признаки полностью без данных исключены автоматически: '
+                       f'{", ".join(nan_cols)} (например K_Конрад — нужна широта станций).')
+            chosen_features = [c for c in chosen_features if c not in nan_cols]
+
+        if len(chosen_features) < 2:
+            st.error('Выберите минимум 2 признака.')
+        else:
+            d_clean, Xs, scaler = clustering.prepare_matrix(ind_table, chosen_features)
+            st.caption(f'Станций с полными данными по выбранным признакам: {len(d_clean)}')
+
+            st.subheader('Подбор числа кластеров')
+            k_max = min(7, len(d_clean) - 1)
+            k_range = range(2, max(3, k_max))
+            has_lat = 'Lat' in d_clean.columns and d_clean['Lat'].notna().any()
+            with st.status('⏳ Идёт расчёт: подбор количества кластеров...',
+                            expanded=False) as status:
+                sil_scores = clustering.silhouette_by_k(Xs, k_range=k_range)
+                ari_scores = clustering.ari_by_k(Xs, d_clean['Lat'].values, k_range=k_range) \
+                    if has_lat else None
+                status.update(label='✅ Подбор количества кластеров завершён', state='complete')
+
+            k_method_options = ['По силуэту']
+            if has_lat:
+                k_method_options += ['По ARI (широтные зоны)', 'Комбинированно (0,6·силуэт + 0,4·ARI)']
+            k_method = st.radio('Метод определения количества кластеров',
+                                 k_method_options, horizontal=False)
+
+            if k_method == 'По силуэту':
+                score_for_k = sil_scores
+            elif k_method == 'По ARI (широтные зоны)':
+                score_for_k = ari_scores
+            else:
+                score_for_k = clustering.combined_scores(sil_scores, ari_scores)
+
+            auto_k = clustering.best_k(score_for_k)
+
+            c1, c2 = st.columns(2)
+            with c1:
+                use_auto = st.checkbox('Подобрать k автоматически', value=True)
+            with c2:
+                if use_auto:
+                    k = auto_k
+                    st.metric('Автоматически выбрано k', k)
+                else:
+                    k = st.slider('Число кластеров (k)', 2, max(2, k_max - 1),
+                                   auto_k or 2)
+
+            figsize_s, _, _ = size_and_color_controls('sil', with_color=False)
+            fig_sil = viz.k_selection_plot(
+                sil_scores, ari_scores=ari_scores if k_method != 'По силуэту' else None,
+                chosen_k=k, title=f'Подбор k: {k_method}', figsize=figsize_s)
+            show_plot(fig_sil)
+            download_row(fig_sil, 'graph_k_selection', 'sil')
+            if not has_lat:
+                st.caption('ARI-критерий недоступен: нет широты станций (загрузите '
+                           'справочник станций с координатами во вкладке "Данные").')
+
+            st.divider()
+            st.subheader('Результат кластеризации')
+            c1, c2 = st.columns(2)
+            with c1:
+                algorithm_label = st.selectbox(
+                    'Алгоритм кластеризации',
+                    ['K-means', 'Иерархическая (Ward)', 'Gaussian Mixture'])
+            with c2:
+                order_feature = st.selectbox('Нумеровать кластеры по убыванию признака',
+                                              chosen_features,
+                                              index=chosen_features.index('P_год')
+                                              if 'P_год' in chosen_features else 0)
+            algorithm_map = {'K-means': 'kmeans', 'Иерархическая (Ward)': 'hierarchical',
+                              'Gaussian Mixture': 'gmm'}
+            with st.status(f'⏳ Идёт расчёт: кластеризация ({algorithm_label})...',
+                            expanded=False) as status:
+                labels, sil = clustering.run_clustering(Xs, k, algorithm=algorithm_map[algorithm_label])
+                relabeled = clustering.relabel_clusters_by_feature(d_clean, labels, order_feature)
+                status.update(label='✅ Кластеризация завершена', state='complete')
+            d_clean = d_clean.copy()
+            d_clean['Кластер'] = relabeled
+            st.success(f'Кластеризация выполнена: {algorithm_label}, k={k}, силуэт={sil:.3f}')
+
+            result_cols = ['Станция'] + [c for c in ['Название', 'Регион', 'Lat', 'Lon']
+                                          if c in d_clean.columns] + ['Кластер'] + chosen_features
+            st.dataframe(d_clean[result_cols], use_container_width=True)
+            st.download_button('📥 Сохранить результат (станция → кластер, .xlsx)',
+                                data_io.df_to_excel_bytes(d_clean[result_cols], 'Районирование'),
+                                file_name='table_clustering_result.xlsx')
+
+            st.divider()
+            st.subheader('PCA-биплот')
+            st.markdown('**PCA-биплот.** Точки — станции, окрашенные по кластеру; '
+                        'стрелки — вклад каждого признака в первые две главные '
+                        'компоненты. Направление и длина стрелки показывают, какой '
+                        'признак сильнее всего определяет положение станции.')
+            figsize_p, _, _ = size_and_color_controls('pca', with_color=False,
+                                                       default_size='Широкий (12×8)')
+            with st.status('⏳ Идёт расчёт: построение PCA...', expanded=False) as status:
+                Xpca, pca_model, ev = clustering.pca_transform(Xs)
+                fig_pca = viz.pca_biplot(Xpca, pca_model, relabeled, chosen_features, ev,
+                                          title=f'PCA: k={k}', figsize=figsize_p)
+                status.update(label='✅ PCA построен', state='complete')
+            show_plot(fig_pca)
+            download_row(fig_pca, 'graph_pca_biplot', 'pca')
+
+            st.divider()
+            st.subheader('Дендрограмма (верификация)')
+            figsize_d, _, _ = size_and_color_controls('dendro', with_color=False,
+                                                       default_size='Широкий (12×8)')
+            with st.status('⏳ Идёт расчёт: построение дендрограммы...', expanded=False) as status:
+                Z = clustering.hierarchical_linkage(Xs)
+                leaf_labels = (d_clean['Название'] if 'Название' in d_clean.columns
+                               else d_clean['Станция']).astype(str).str[:10].tolist()
+                thr = (Z[-(k - 1), 2] + Z[-k, 2]) / 2 if k > 1 and len(Z) >= k else None
+                fig_dendro = viz.dendrogram_plot(Z, leaf_labels, threshold=thr,
+                                                  title='Иерархическая кластеризация (Уорд)',
+                                                  figsize=figsize_d)
+                status.update(label='✅ Дендрограмма построена', state='complete')
+            show_plot(fig_dendro, width_frac=0.85)
+            download_row(fig_dendro, 'graph_dendrogram', 'dendro')
+
+            st.divider()
+            st.subheader('Характеристика кластеров')
+            summary_cols = st.multiselect('Признаки для сводной таблицы', chosen_features,
+                                           default=chosen_features[:5], key='cluster_summary_feats')
+            if summary_cols:
+                summ = clustering.cluster_summary_table(d_clean, summary_cols, 'Кластер')
+                st.dataframe(summ, use_container_width=True)
+                st.download_button('Сохранить сводку по кластерам (.xlsx)',
+                                    data_io.df_to_excel_bytes(summ, 'Сводка кластеров'),
+                                    file_name='table_cluster_summary.xlsx')
+
+                st.divider()
+                st.subheader('Боксплот по кластерам')
+                box_feat = st.selectbox('Признак для боксплота', summary_cols, key='cluster_box_feat')
+                annotate_on_chart_c = st.checkbox('Показывать Мин/Макс на графике', value=False,
+                                                   key='cluster_box_annotate')
+                figsize_b, color_b, legend_b = size_and_color_controls('cbox', with_color=False)
+                fig_box = viz.boxplot_groups(d_clean, box_feat, 'Кластер',
+                                              title=f'{box_feat} по кластерам', ylabel=box_feat,
+                                              figsize=figsize_b, legend_loc=legend_b,
+                                              annotate_minmax=annotate_on_chart_c)
+                show_plot(fig_box)
+                download_row(fig_box, f'graph_cluster_box_{box_feat}', 'cbox')
+                st.markdown('**Мин/Макс/Среднее/Медиана по кластерам:**')
+                st.dataframe(viz.boxplot_minmax_summary(d_clean, box_feat, 'Кластер'),
+                             use_container_width=True)
+
+            st.divider()
+            st.subheader('Карта')
+            has_coords = 'Lat' in d_clean.columns and 'Lon' in d_clean.columns \
+                and d_clean['Lat'].notna().any() and d_clean['Lon'].notna().any()
+            if not has_coords:
+                st.info('Координаты станций не загружены — карта недоступна. '
+                        'Загрузите справочник станций с широтой/долготой во вкладке '
+                        '"Данные" (роль "Справочник станций"), затем пересоберите '
+                        'общий набор данных и рассчитайте индексы заново.')
+            else:
+                map_mode = st.radio('Тип карты',
+                                     ['Точки станций (простая)',
+                                      'Раскраска районов (Overpass API — автозагрузка)',
+                                      'Раскраска районов (свой файл GeoJSON/Shapefile)'])
+
+                if map_mode == 'Точки станций (простая)':
+                    show_labels = st.checkbox('Показывать подписи станций на карте', value=True)
+                    figsize_m, _, _ = size_and_color_controls('map', with_color=False,
+                                                                default_size='Широкий (12×8)')
+                    label_col = 'Название' if 'Название' in d_clean.columns else 'Станция'
+                    fig_map = viz.map_scatter(d_clean, cluster_col='Кластер', label_col=label_col,
+                                               title=f'Пространственное распределение кластеров (k={k})',
+                                               figsize=figsize_m, show_labels=show_labels)
+                    show_plot(fig_map, width_frac=0.75)
+                    download_row(fig_map, 'graph_cluster_map', 'map')
+
+                elif map_mode == 'Раскраска районов (Overpass API — автозагрузка)':
+                    st.markdown(
+                        'Границы районов скачиваются напрямую с OpenStreetMap через '
+                        'Overpass API — это работает с вашего компьютера (обычный '
+                        'доступ в интернет нужен именно у вас). Первая '
+                        'загрузка может занять 10–60 секунд.'
+                    )
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        region_name = st.text_input('Название региона (как в OSM)',
+                                                     value='Новосибирская область')
+                    with c2:
+                        admin_level = st.number_input('Admin_level районов', min_value=2,
+                                                        max_value=10, value=6,
+                                                        help='Обычно 6 — районы области; '
+                                                             '4 — сама область/край; '
+                                                             '8 — сельсоветы/города')
+                    cache_key = f'{region_name}__{admin_level}'
+                    if st.button('🌐 Сохранить границы районов'):
+                        try:
+                            with st.status('⏳ Идёт расчёт: запрос к Overpass API '
+                                           '(может занять до минуты)...', expanded=True) as status:
+                                polys = mapping.fetch_boundaries_overpass(
+                                    region_name, admin_level=int(admin_level))
+                                status.update(label='✅ Границы районов загружены', state='complete')
+                            st.session_state['overpass_cache'] = {cache_key: polys}
+                            st.success(f'Загружено {len(polys)} районов.')
+                        except Exception as e:
+                            st.error(f'Не удалось загрузить границы: {e}')
+
+                    cached = st.session_state.get('overpass_cache', {}).get(cache_key)
+                    if cached:
+                        polys_ov = bbox_filter_controls(cached, d_clean, 'ov_bbox')
+                        with st.status('⏳ Идёт расчёт: определение кластеров по районам...',
+                                       expanded=False) as status:
+                            assigned = mapping.assign_clusters_to_polygons(polys_ov, d_clean)
+                            status.update(label='✅ Готово', state='complete')
+                        show_district_labels = st.checkbox('Подписывать районы', value=False)
+                        show_station_pts = st.checkbox('Показывать точки станций', value=True,
+                                                        key='overpass_show_pts')
+                        figsize_ch, _, _ = size_and_color_controls('choropleth_ov', with_color=False,
+                                                                    default_size='Широкий (12×8)')
+                        with st.status('⏳ Идёт расчёт: отрисовка карты...', expanded=False) as status:
+                            fig_ch = viz.choropleth_map(
+                                assigned, stations_df=d_clean if show_station_pts else None,
+                                title=f'Районирование по кластерам (k={k})', figsize=figsize_ch,
+                                show_station_points=show_station_pts,
+                                show_district_labels=show_district_labels)
+                            status.update(label='✅ Карта готова', state='complete')
+                        show_plot(fig_ch, width_frac=0.8)
+                        download_row(fig_ch, 'graph_choropleth_overpass', 'choropleth_ov')
+
+                        assign_table = build_district_assignment_table(assigned)
+                        st.markdown('Сначала — районы, где кластер определён по станциям '
+                                    'внутри границ; затем — районы без станций (кластер '
+                                    'присвоен по ближайшей станции).')
+                        st.dataframe(assign_table, use_container_width=True)
+                        st.download_button('Сохранить таблицу район→кластер (.xlsx)',
+                                            data_io.df_to_excel_bytes(assign_table, 'Районы'),
+                                            file_name='table_district_clusters.xlsx')
+
+                else:  # свой файл
+                    st.markdown('Загрузите **GeoJSON** (один файл) или **Shapefile** '
+                               '(три файла: .shp, .dbf, .shx одновременно).')
+                    upload_kind = st.radio('Формат файла', ['GeoJSON', 'Shapefile (.shp+.dbf+.shx)'],
+                                            horizontal=True)
+                    polys_uploaded = None
+                    if upload_kind == 'GeoJSON':
+                        gj_file = st.file_uploader('Файл .geojson', type=['geojson', 'json'])
+                        if gj_file is not None:
+                            try:
+                                polys_uploaded = mapping.read_geojson_file(gj_file.read())
+                                st.success(f'Загружено {len(polys_uploaded)} полигонов.')
+                            except Exception as e:
+                                st.error(f'Ошибка чтения GeoJSON: {e}')
+                    else:
+                        shp_files = st.file_uploader('Файлы .shp, .dbf, .shx (выберите все три)',
+                                                      type=['shp', 'dbf', 'shx'],
+                                                      accept_multiple_files=True)
+                        if shp_files and len(shp_files) >= 3:
+                            by_ext = {f.name.rsplit('.', 1)[-1].lower(): f for f in shp_files}
+                            if all(ext in by_ext for ext in ['shp', 'dbf', 'shx']):
+                                try:
+                                    polys_uploaded, fields = mapping.read_shapefile(
+                                        by_ext['shp'].read(), by_ext['dbf'].read(),
+                                        by_ext['shx'].read())
+                                    st.success(f'Загружено {len(polys_uploaded)} полигонов. '
+                                               f'Поля атрибутов: {", ".join(fields)}')
+                                except Exception as e:
+                                    st.error(f'Ошибка чтения Shapefile: {e}')
+                            else:
+                                st.warning('Нужны все три файла: .shp, .dbf, .shx')
+
+                    if polys_uploaded:
+                        st.caption(f'Всего загружено полигонов: {len(polys_uploaded)}')
+                        available_fields = sorted({k for p in polys_uploaded
+                                                    for k in p.get('properties', {}).keys()})
+                        st.markdown('**Фильтр по региону** (нужно, если файл содержит всю '
+                                    'страну — например GADM с районами всей России)')
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            filter_field = st.selectbox('Поле атрибутов для фильтра',
+                                                          ['— без фильтра —'] + available_fields,
+                                                          key='filter_field')
+                        with c2:
+                            filter_value = ''
+                            if filter_field != '— без фильтра —':
+                                field_values = mapping.list_property_values(polys_uploaded, filter_field)
+                                filter_value = st.selectbox('Значение (например область/край)',
+                                                             ['— все —'] + field_values,
+                                                             key='filter_value')
+
+                        if filter_field != '— без фильтра —' and filter_value not in ('', '— все —'):
+                            polys_uploaded = mapping.filter_polygons_by_attribute(
+                                polys_uploaded, filter_field, filter_value)
+                            st.info(f'После фильтра осталось полигонов: {len(polys_uploaded)}')
+
+                        polys_uploaded = bbox_filter_controls(polys_uploaded, d_clean, 'upload_bbox')
+
+                        with st.status('⏳ Идёт расчёт: определение кластеров по районам...',
+                                       expanded=False) as status:
+                            assigned = mapping.assign_clusters_to_polygons(polys_uploaded, d_clean)
+                            status.update(label='✅ Готово', state='complete')
+                        show_district_labels_u = st.checkbox('Подписывать районы', value=False,
+                                                              key='upload_show_labels')
+                        show_station_pts_u = st.checkbox('Показывать точки станций', value=True,
+                                                          key='upload_show_pts')
+                        figsize_chu, _, _ = size_and_color_controls('choropleth_up', with_color=False,
+                                                                     default_size='Широкий (12×8)')
+                        with st.status('⏳ Идёт расчёт: отрисовка карты...', expanded=False) as status:
+                            fig_chu = viz.choropleth_map(
+                                assigned, stations_df=d_clean if show_station_pts_u else None,
+                                title=f'Районирование по кластерам (k={k})', figsize=figsize_chu,
+                                show_station_points=show_station_pts_u,
+                                show_district_labels=show_district_labels_u)
+                            status.update(label='✅ Карта готова', state='complete')
+                        show_plot(fig_chu, width_frac=0.8)
+                        download_row(fig_chu, 'graph_choropleth_upload', 'choropleth_up')
+
+                        assign_table_u = build_district_assignment_table(assigned)
+                        st.markdown('Сначала — районы, где кластер определён по станциям '
+                                    'внутри границ; затем — районы без станций (кластер '
+                                    'присвоен по ближайшей станции).')
+                        st.dataframe(assign_table_u, use_container_width=True)
+                        st.download_button('Сохранить таблицу район→кластер (.xlsx)',
+                                            data_io.df_to_excel_bytes(assign_table_u, 'Районы'),
+                                            file_name='table_district_clusters.xlsx')
